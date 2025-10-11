@@ -1,0 +1,17 @@
+#
+# Definition of all trackable objects
+# Identifier corresponds to Trackable ID set in Tracking Tools
+#
+rigid_bodies:
+    '7':
+        pose: warthog/pose
+        # pose2d: warthog/ground_pose
+        odom: warthog/Odom
+        # tf: tf
+        # child_frame_id: warthog/base_link
+        parent_frame_id: world
+optitrack_config:
+        multicast_address: 224.0.0.1
+        command_port: 1510
+        data_port: 9000
+        enable_optitrack: true
