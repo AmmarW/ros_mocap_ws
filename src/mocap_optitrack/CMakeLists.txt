@@ -22,6 +22,7 @@ find_package(catkin REQUIRED COMPONENTS
   geometry_msgs
   nav_msgs
   dynamic_reconfigure
+  diagnostic_updater
   std_msgs
   tf)
 
@@ -35,6 +36,7 @@ catkin_package(
   INCLUDE_DIRS include
   CATKIN_DEPENDS roscpp
   dynamic_reconfigure
+  diagnostic_updater
 )
 
 include_directories(include
@@ -69,6 +71,9 @@ if (CATKIN_ENABLE_TESTING)
     src/version.cpp)
   target_include_directories(test_natnet_timestamp PRIVATE src)
   target_link_libraries(test_natnet_timestamp ${catkin_LIBRARIES})
+
+  catkin_add_gtest(test_frame_statistics test/test_frame_statistics.cpp)
+  target_link_libraries(test_frame_statistics ${catkin_LIBRARIES})
 
   catkin_add_gtest(test_natnet_bounds
     test/test_natnet_bounds.cpp

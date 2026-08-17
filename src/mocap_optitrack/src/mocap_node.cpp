@@ -34,9 +34,11 @@
 #include <mocap_optitrack/mocap_config.h>
 #include <mocap_optitrack/rigid_body_publisher.h>
 #include <mocap_optitrack/timestamp_sync.h>
+#include <mocap_optitrack/frame_statistics.h>
 #include <mocap_optitrack/MocapOptitrackConfig.h>
 #include "natnet/natnet_messages.h"
 
+#include <diagnostic_updater/diagnostic_updater.h>
 #include <dynamic_reconfigure/server.h>
 #include <memory>
 #include <ros/ros.h>
@@ -67,6 +69,11 @@ public:
     // The frame counter is the only way a consumer can tell a dropped frame
     // from a merely delayed one, so it is published alongside the poses.
     frameNumberPublisher = nh.advertise<std_msgs::UInt32>("frame_number", 1000);
+
+    // Stream health is otherwise only apparent after the fact, from a recording.
+    // Reporting it live lets a degraded run be noticed while it is still running.
+    diagnosticUpdater.setHardwareID("optitrack");
+    diagnosticUpdater.add("Mocap stream", this, &OptiTrackRosBridge::produceDiagnostics);
   }
 
   void reconfigureCallback(MocapOptitrackConfig& config, uint32_t)
@@ -141,9 +148,12 @@ public:
           frameNumberMsg.data = static_cast<uint32_t>(dataModel.frameNumber);
           frameNumberPublisher.publish(frameNumberMsg);
 
+          accumulateStatistics(time);
+
           // Clear out the model to prepare for the next frame of data
           dataModel.clear();
         }
+        diagnosticUpdater.update();
         // whether receive or nor, give a short break to relieft the CPU load due to while()
         usleep(100);
       }
@@ -185,6 +195,82 @@ private:
     return stamp;
   }
 
+  /// \brief Fold the frame just received into the running stream statistics.
+  void accumulateStatistics(ros::Time const& frameTime)
+  {
+    bool anyTracked = false;
+    double markerErrorSum = 0.0;
+    for (auto const& body : dataModel.dataFrame.rigidBodies)
+    {
+      anyTracked = anyTracked || body.isTrackingValid;
+      markerErrorSum += body.meanMarkerError;
+    }
+    double const meanMarkerError = dataModel.dataFrame.rigidBodies.empty()
+      ? 0.0
+      : markerErrorSum / dataModel.dataFrame.rigidBodies.size();
+
+    frameStatistics.update(dataModel.frameNumber, frameTime.toSec(),
+                           anyTracked, meanMarkerError);
+  }
+
+  /// \brief Report stream health, and reset the window so each report covers
+  ///        the interval since the last one rather than the whole session.
+  void produceDiagnostics(diagnostic_updater::DiagnosticStatusWrapper& status)
+  {
+    if (!initialized)
+    {
+      status.summary(diagnostic_msgs::DiagnosticStatus::WARN,
+                     "Not connected to a mocap server");
+      return;
+    }
+
+    if (!frameStatistics.hasData())
+    {
+      status.summary(diagnostic_msgs::DiagnosticStatus::WARN,
+                     "Connected but receiving no frames");
+      frameStatistics.reset();
+      return;
+    }
+
+    double const dropPercent = frameStatistics.getDropPercent();
+    double const untrackedPercent = frameStatistics.getUntrackedPercent();
+
+    if (dropPercent > 5.0)
+    {
+      status.summaryf(diagnostic_msgs::DiagnosticStatus::ERROR,
+                      "Losing %.1f%% of frames", dropPercent);
+    }
+    else if (dropPercent > 1.0)
+    {
+      status.summaryf(diagnostic_msgs::DiagnosticStatus::WARN,
+                      "Losing %.1f%% of frames", dropPercent);
+    }
+    else if (untrackedPercent > 50.0)
+    {
+      status.summaryf(diagnostic_msgs::DiagnosticStatus::WARN,
+                      "No body solved in %.1f%% of frames", untrackedPercent);
+    }
+    else
+    {
+      status.summaryf(diagnostic_msgs::DiagnosticStatus::OK,
+                      "Streaming at %.1f Hz", frameStatistics.getCaptureRateHz());
+    }
+
+    status.add("Capture rate (Hz)", frameStatistics.getCaptureRateHz());
+    status.add("Received rate (Hz)", frameStatistics.getReceivedRateHz());
+    status.add("Frames received", frameStatistics.getReceivedFrames());
+    status.add("Frames dropped", frameStatistics.getDroppedFrames());
+    status.add("Frames dropped (%)", dropPercent);
+    status.add("Largest consecutive gap", frameStatistics.getLargestGap());
+    status.add("Frames with no body solved (%)", untrackedPercent);
+    status.add("Mean marker error", frameStatistics.getMeanMarkerError());
+    status.add("Max marker error", frameStatistics.getMaxMarkerError());
+    status.add("Timestamp source",
+               useMocapTimestamps ? "mocap capture time" : "arrival time");
+
+    frameStatistics.reset();
+  }
+
   bool updateDataModelFromServer()
   {
     // Get data from mocap server
@@ -215,6 +301,8 @@ private:
   bool useMocapTimestamps;
   TimestampSynchronizer timestampSync;
   ros::Publisher frameNumberPublisher;
+  FrameStatistics frameStatistics;
+  diagnostic_updater::Updater diagnosticUpdater;
 };
 
 }  // namespace mocap_optitrack
