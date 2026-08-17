@@ -42,6 +42,9 @@
 #include <dynamic_reconfigure/server.h>
 #include <memory>
 #include <ros/ros.h>
+#include <sstream>
+#include <string>
+#include <std_msgs/String.h>
 #include <std_msgs/UInt32.h>
 
 
@@ -54,7 +57,8 @@ public:
   OptiTrackRosBridge(ros::NodeHandle& nh,
                      ServerDescription const& serverDescr,
                      PublisherConfigurations const& pubConfigs) :
-    nh(nh), server(ros::NodeHandle("~/optitrack_config"))
+    nh(nh), server(ros::NodeHandle("~/optitrack_config")),
+    initialized(false), useMocapTimestamps(true), measuredRatePublished(false)
   {
     server.setCallback(boost::bind(&OptiTrackRosBridge::reconfigureCallback, this, _1, _2));
     serverDescription = serverDescr;
@@ -74,6 +78,11 @@ public:
     // Reporting it live lets a degraded run be noticed while it is still running.
     diagnosticUpdater.setHardwareID("optitrack");
     diagnosticUpdater.add("Mocap stream", this, &OptiTrackRosBridge::produceDiagnostics);
+
+    // Latched, so a recording started at any point still captures it. Nothing
+    // else in the stream records what produced it, which leaves later analysis
+    // guessing at the capture rate and protocol version it was taken with.
+    serverInfoPublisher = nh.advertise<std_msgs::String>("server_info", 1, true);
   }
 
   void reconfigureCallback(MocapOptitrackConfig& config, uint32_t)
@@ -123,6 +132,12 @@ public:
                                        publisherConfigurations));
       ROS_INFO("Initialization complete");
       initialized = true;
+
+      // Publish what is known now; republished once with the measured capture
+      // rate after enough frames have been seen to estimate it.
+      provenanceStatistics.reset();
+      measuredRatePublished = false;
+      publishServerInfo();
     }
     else
     {
@@ -153,7 +168,6 @@ public:
           // Clear out the model to prepare for the next frame of data
           dataModel.clear();
         }
-        diagnosticUpdater.update();
         // whether receive or nor, give a short break to relieft the CPU load due to while()
         usleep(100);
       }
@@ -161,6 +175,10 @@ public:
       {
         ros::Duration(1.).sleep();
       }
+      // Outside the branch above: a node that never connected is exactly the
+      // case a consumer most needs told about, so diagnostics have to keep
+      // being published when there is no data rather than fall silent.
+      diagnosticUpdater.update();
       ros::spinOnce();
     }
   }
@@ -195,6 +213,42 @@ private:
     return stamp;
   }
 
+  /// \brief Describe what produced this stream, as a YAML mapping.
+  ///
+  /// A recording of poses alone does not say what protocol version decoded it,
+  /// what rate the system was capturing at, or which clock stamped it, yet all
+  /// three are needed to interpret the data later. Publishing them latched puts
+  /// them in the recording alongside the poses.
+  void publishServerInfo()
+  {
+    std::ostringstream info;
+    info << "natnet_version: \"" << dataModel.getNatNetVersion().getVersionString() << "\"\n"
+         << "server_version: \"" << dataModel.getServerVersion().getVersionString() << "\"\n"
+         << "timestamp_source: \""
+         << (useMocapTimestamps ? "mocap_capture_time" : "message_arrival_time") << "\"\n"
+         << "multicast_address: \"" << serverDescription.multicastIpAddress << "\"\n"
+         << "data_port: " << serverDescription.dataPort << "\n"
+         << "command_port: " << serverDescription.commandPort << "\n";
+
+    // Only meaningful once enough frames have been seen to measure it.
+    if (provenanceStatistics.hasData())
+    {
+      info << "measured_capture_rate_hz: "
+           << provenanceStatistics.getCaptureRateHz() << "\n";
+    }
+
+    info << "rigid_body_ids: [";
+    for (size_t i = 0; i < publisherConfigurations.size(); ++i)
+    {
+      info << (i ? ", " : "") << publisherConfigurations[i].rigidBodyId;
+    }
+    info << "]\n";
+
+    std_msgs::String msg;
+    msg.data = info.str();
+    serverInfoPublisher.publish(msg);
+  }
+
   /// \brief Fold the frame just received into the running stream statistics.
   void accumulateStatistics(ros::Time const& frameTime)
   {
@@ -211,6 +265,21 @@ private:
 
     frameStatistics.update(dataModel.frameNumber, frameTime.toSec(),
                            anyTracked, meanMarkerError);
+
+    // A second, never reset accumulator, purely to measure the capture rate
+    // for the provenance message. Republished once when the estimate has had
+    // enough frames to settle; latched, so the last one is what a recording
+    // picks up.
+    if (!measuredRatePublished)
+    {
+      provenanceStatistics.update(dataModel.frameNumber, frameTime.toSec(),
+                                  anyTracked, meanMarkerError);
+      if (provenanceStatistics.getReceivedFrames() >= kRateEstimateFrames)
+      {
+        publishServerInfo();
+        measuredRatePublished = true;
+      }
+    }
   }
 
   /// \brief Report stream health, and reset the window so each report covers
@@ -303,6 +372,12 @@ private:
   ros::Publisher frameNumberPublisher;
   FrameStatistics frameStatistics;
   diagnostic_updater::Updater diagnosticUpdater;
+  ros::Publisher serverInfoPublisher;
+  FrameStatistics provenanceStatistics;
+  bool measuredRatePublished;
+
+  /// Frames averaged before the measured capture rate is considered settled.
+  static int const kRateEstimateFrames = 600;
 };
 
 }  // namespace mocap_optitrack
