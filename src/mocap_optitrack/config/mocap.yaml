@@ -7,6 +7,11 @@ rigid_bodies:
         pose: warthog/pose
         # pose2d: warthog/ground_pose
         odom: warthog/Odom
+        # Tracking quality outputs. Publish these to tell an untracked frame
+        # apart from a frame that never arrived: tracking_valid is emitted for
+        # every frame, including those that produce no pose.
+        # marker_error: warthog/marker_error
+        # tracking_valid: warthog/tracking_valid
         # tf: tf
         # child_frame_id: warthog/base_link
         parent_frame_id: world

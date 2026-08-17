@@ -82,6 +82,8 @@ const std::string RigidBodies = "rigid_bodies";
 const std::string PoseTopicName = "pose";
 const std::string Pose2dTopicName = "pose2d";
 const std::string OdomTopicName = "odom";
+const std::string MarkerErrorTopicName = "marker_error";
+const std::string TrackingValidTopicName = "tracking_valid";
 const std::string EnableTfPublisher = "tf";
 const std::string ChildFrameId = "child_frame_id";
 const std::string ParentFrameId = "parent_frame_id";
@@ -212,6 +214,17 @@ void NodeConfiguration::fromRosParam(
           {
             publisherConfig.publishOdom = true;
           }
+
+          // Tracking quality outputs. These are optional and silent by default,
+          // but a consumer that cares why a pose is missing needs them: without
+          // them an untracked frame is indistinguishable from a lost one.
+          publisherConfig.publishMarkerError = impl::check_and_get_param(bodyParameters,
+                                   rosparam::keys::MarkerErrorTopicName,
+                                   publisherConfig.markerErrorTopicName);
+
+          publisherConfig.publishTrackingValid = impl::check_and_get_param(bodyParameters,
+                                   rosparam::keys::TrackingValidTopicName,
+                                   publisherConfig.trackingValidTopicName);
 
           bool readEnableTfPublisher = impl::check_and_get_param(bodyParameters,
                                rosparam::keys::EnableTfPublisher, publisherConfig.enableTfPublisher);

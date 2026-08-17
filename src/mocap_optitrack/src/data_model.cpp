@@ -33,6 +33,9 @@ namespace mocap_optitrack
 {
 
 RigidBody::RigidBody() :
+  bodyId(-1),
+  pose(),
+  meanMarkerError(0.0f),
   isTrackingValid(false)
 {
 }
