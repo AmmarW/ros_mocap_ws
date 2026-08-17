@@ -1,7 +1,10 @@
 cmake_minimum_required(VERSION 3.0.2)
 project(vicon_bridge)
 
-set(CMAKE_CXX_STANDARD 14)
+# C++17 rather than 14: on current Noetic systems log4cxx, reached through
+# ros/console.h, uses std::shared_mutex and will not compile below 17.
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(catkin REQUIRED COMPONENTS
     message_generation

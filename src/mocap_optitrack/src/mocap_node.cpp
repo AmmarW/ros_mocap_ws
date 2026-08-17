@@ -33,12 +33,14 @@
 #include <mocap_optitrack/data_model.h>
 #include <mocap_optitrack/mocap_config.h>
 #include <mocap_optitrack/rigid_body_publisher.h>
+#include <mocap_optitrack/timestamp_sync.h>
 #include <mocap_optitrack/MocapOptitrackConfig.h>
 #include "natnet/natnet_messages.h"
 
 #include <dynamic_reconfigure/server.h>
 #include <memory>
 #include <ros/ros.h>
+#include <std_msgs/UInt32.h>
 
 
 namespace mocap_optitrack
@@ -55,6 +57,16 @@ public:
     server.setCallback(boost::bind(&OptiTrackRosBridge::reconfigureCallback, this, _1, _2));
     serverDescription = serverDescr;
     publisherConfigurations = pubConfigs;
+
+    // Stamping against Motive's capture time is the correct behaviour, but it
+    // is left switchable: a server that reports no timestamp, or a deployment
+    // that deliberately wants arrival time, can fall back without a rebuild.
+    ros::NodeHandle privateNh("~");
+    privateNh.param("use_mocap_timestamps", useMocapTimestamps, true);
+
+    // The frame counter is the only way a consumer can tell a dropped frame
+    // from a merely delayed one, so it is published alongside the poses.
+    frameNumberPublisher = nh.advertise<std_msgs::UInt32>("frame_number", 1000);
   }
 
   void reconfigureCallback(MocapOptitrackConfig& config, uint32_t)
@@ -122,8 +134,12 @@ public:
         {
           // Maybe we got some data? If we did it would be in the form of one or more
           // rigid bodies in the data model
-          ros::Time time = ros::Time::now();
+          ros::Time time = resolveFrameTime(dataModel.dataFrame);
           publishDispatcherPtr->publish(time, dataModel.dataFrame.rigidBodies);
+
+          std_msgs::UInt32 frameNumberMsg;
+          frameNumberMsg.data = static_cast<uint32_t>(dataModel.frameNumber);
+          frameNumberPublisher.publish(frameNumberMsg);
 
           // Clear out the model to prepare for the next frame of data
           dataModel.clear();
@@ -140,6 +156,35 @@ public:
   }
 
 private:
+  /// \brief Decide what time to stamp this frame with.
+  ///
+  /// Arrival time is only a stand-in for capture time when the socket is
+  /// drained promptly. It is not: the receive loop polls, so a queued backlog
+  /// is emitted in a burst and successive frames land far closer together than
+  /// the 1/framerate they were actually captured at. Motive's own timestamp is
+  /// immune to that, so it is preferred whenever the server supplies one.
+  ros::Time resolveFrameTime(ModelFrame const& frame)
+  {
+    ros::Time const now = ros::Time::now();
+
+    if (!useMocapTimestamps || !frame.hasTimestamp)
+    {
+      ROS_WARN_ONCE_NAMED("timestamps",
+        "Stamping mocap poses with arrival time. Intervals between poses will "
+        "not reflect true capture intervals; differentiating them for velocity "
+        "or acceleration will be inaccurate.");
+      return now;
+    }
+
+    ros::Time const stamp(timestampSync.toRosTime(frame.timestamp, now.toSec()));
+
+    ROS_INFO_ONCE_NAMED("timestamps",
+      "Stamping mocap poses with Motive capture time (offset %.6f s).",
+      timestampSync.getOffset());
+
+    return stamp;
+  }
+
   bool updateDataModelFromServer()
   {
     // Get data from mocap server
@@ -167,6 +212,9 @@ private:
   std::unique_ptr<RigidBodyPublishDispatcher> publishDispatcherPtr;
   dynamic_reconfigure::Server<MocapOptitrackConfig> server;
   bool initialized;
+  bool useMocapTimestamps;
+  TimestampSynchronizer timestampSync;
+  ros::Publisher frameNumberPublisher;
 };
 
 }  // namespace mocap_optitrack

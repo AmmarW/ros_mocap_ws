@@ -55,7 +55,9 @@ void MarkerSet::clear()
 
 
 ModelFrame::ModelFrame() :
-  latency(0.0)
+  latency(0.0),
+  timestamp(0.0),
+  hasTimestamp(false)
 {
 }
 
@@ -64,6 +66,8 @@ void ModelFrame::clear()
   markerSets.clear();
   otherMarkers.clear();
   rigidBodies.clear();
+  timestamp = 0.0;
+  hasTimestamp = false;
 }
 
 

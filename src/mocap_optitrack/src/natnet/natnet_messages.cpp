@@ -454,6 +454,14 @@ void DataFrameMessage::deserialize(
   }
   ROS_DEBUG("Timestamp: %3.3f", timestamp);
 
+  // Retain the capture instant. Publishing against this rather than against
+  // arrival time is what keeps the interval between successive poses equal to
+  // the true camera frame interval; arrival time is distorted by socket-queue
+  // backlog. Motive counts seconds from its own startup, so zero is a legal
+  // value for the very first frames and only a negative value is nonsense.
+  dataFrame->timestamp = timestamp;
+  dataFrame->hasTimestamp = (timestamp >= 0.0);
+
   // high res timestamps (version 3.0 and later)
   if (NatNetVersion >= mocap_optitrack::Version("3.0"))
   {

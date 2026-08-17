@@ -33,6 +33,7 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *********************************************************************/
 
+#include <algorithm>
 #include <iostream>
 #include <map>
 #include <unordered_map>
@@ -186,6 +187,14 @@ private:
 
   bool broadcast_tf_, publish_tf_, publish_markers_;
 
+  // Deriving stamps from the Vicon frame counter rather than from arrival time.
+  // See resolveFrameTime() for why, and for why this is off by default.
+  bool use_frame_timestamps_;
+  double frame_rate_hz_;
+  double frame_time_offset_;
+  double frame_time_last_capture_;
+  unsigned int frame_time_samples_;
+
   bool grab_frames_;
   // boost::thread grab_frames_thread_;
   // std::unordered_map<std::string, ros::Publisher> segment_publishers_;
@@ -218,7 +227,9 @@ public:
     stream_mode_("ClientPull"),
         host_name_(""), tf_ref_frame_id_("world"), tracked_frame_suffix_("vicon"),
         lastFrameNumber(0), frameCount(0), droppedFrameCount(0), frame_datum(0), n_markers(0), n_unlabeled_markers(0),
-        marker_data_enabled(false), unlabeled_marker_data_enabled(false), grab_frames_(false)
+        marker_data_enabled(false), unlabeled_marker_data_enabled(false),
+        use_frame_timestamps_(false), frame_rate_hz_(0.0), frame_time_offset_(0.0),
+        frame_time_last_capture_(0.0), frame_time_samples_(0), grab_frames_(false)
   {
     // Diagnostics
     diag_updater.add("ViconReceiver Status", this, &ViconReceiver::diagnostics);
@@ -232,6 +243,12 @@ public:
     nh_priv.param("broadcast_transform", broadcast_tf_, true);
     nh_priv.param("publish_transform", publish_tf_, true);
     nh_priv.param("publish_markers", publish_markers_, true);
+    // Off by default: unlike the OptiTrack path, this has not been validated
+    // against recorded Vicon data, and the existing latency-compensated
+    // behaviour is adequate for consumers that do not differentiate the pose.
+    nh_priv.param("use_frame_timestamps", use_frame_timestamps_, false);
+    // 0 means "ask the Vicon system"; set it only to override a wrong report.
+    nh_priv.param("frame_rate", frame_rate_hz_, 0.0);
     if (init_vicon() == false){
       ROS_ERROR("Error while connecting to Vicon. Exiting now.");
       return;
@@ -323,6 +340,34 @@ private:
     Output_GetVersion _Output_GetVersion = vicon_client_.GetVersion();
     ROS_INFO_STREAM("Version: " << _Output_GetVersion.Major << "." << _Output_GetVersion.Minor << "."
         << _Output_GetVersion.Point);
+
+    if (use_frame_timestamps_)
+    {
+      // A rate is needed to turn the frame counter into a capture time. Trust
+      // the explicit parameter if one was given, otherwise ask the system.
+      if (frame_rate_hz_ <= 0.0)
+      {
+        // The rate is only reported once frames are flowing, so pull one first.
+        vicon_client_.GetFrame();
+        Output_GetFrameRate rate = vicon_client_.GetFrameRate();
+        if (rate.Result == Result::Success && rate.FrameRateHz > 0.0)
+        {
+          frame_rate_hz_ = rate.FrameRateHz;
+        }
+      }
+
+      if (frame_rate_hz_ > 0.0)
+      {
+        ROS_INFO_STREAM("Stamping poses from the Vicon frame counter at "
+            << frame_rate_hz_ << " Hz.");
+      }
+      else
+      {
+        ROS_WARN_STREAM("use_frame_timestamps was requested but no frame rate is "
+            "available; falling back to latency-compensated arrival time. Set "
+            "the 'frame_rate' parameter to force it.");
+      }
+    }
     return true;
   }
 
@@ -406,6 +451,61 @@ private:
     return true;
   }
 
+  /// \brief Choose the stamp for a frame.
+  ///
+  /// now_time records when this thread got round to the frame, not when the
+  /// cameras captured it. GetFrame() hands back whatever the SDK has buffered,
+  /// so a backlog is drained faster than real time and consecutive frames pick
+  /// up arrival times closer together than the true frame interval. Subtracting
+  /// the reported latency corrects the average but not that compression, and
+  /// GetLatencyTotal() varies frame to frame, contributing jitter of its own.
+  ///
+  /// The frame counter suffers from neither: frame N was captured exactly
+  /// N/rate after frame 0, whatever the network did afterwards. So capture time
+  /// is rebuilt from the counter, and the offset onto ROS time is estimated
+  /// from the least delayed arrival observed - transport delay being strictly
+  /// positive, the smallest (arrival - capture) is the closest to truth.
+  ros::Time resolveFrameTime(unsigned int frameNumber,
+                             ros::Time const& arrival,
+                             ros::Duration const& latency)
+  {
+    if (!use_frame_timestamps_ || frame_rate_hz_ <= 0.0)
+    {
+      return arrival - latency;
+    }
+
+    double const capture = static_cast<double>(frameNumber) / frame_rate_hz_;
+    double const delta = arrival.toSec() - capture;
+
+    // Roughly two seconds of frames spent adopting the running minimum, so an
+    // unlucky first arrival does not offset the whole stream.
+    unsigned int const calibrationSamples =
+      static_cast<unsigned int>(2.0 * frame_rate_hz_);
+
+    if (frame_time_samples_ == 0)
+    {
+      frame_time_offset_ = delta;
+    }
+    else if (frame_time_samples_ < calibrationSamples)
+    {
+      frame_time_offset_ = std::min(frame_time_offset_, delta);
+    }
+    else
+    {
+      // Calibrated: allow only enough movement to follow genuine drift between
+      // the Vicon host clock and this one (100 ppm), so neither a stalled frame
+      // nor a burst can drag the timeline about.
+      double const bound = 1.0e-4 * std::max(0.0, capture - frame_time_last_capture_);
+      frame_time_offset_ = std::max(frame_time_offset_ - bound,
+                                    std::min(delta, frame_time_offset_ + bound));
+    }
+
+    ++frame_time_samples_;
+    frame_time_last_capture_ = capture;
+
+    return ros::Time(capture + frame_time_offset_);
+  }
+
   bool process_frame()
   {
     static ros::Time lastTime;
@@ -436,15 +536,17 @@ private:
     {
       freq_status_.tick();
       ros::Duration vicon_latency(vicon_client_.GetLatencyTotal().Total);
+      ros::Time const frame_time =
+        resolveFrameTime(lastFrameNumber, now_time, vicon_latency);
 
       if(publish_tf_ || broadcast_tf_)
       {
-        process_subjects(now_time - vicon_latency);
+        process_subjects(frame_time);
       }
 
       if(publish_markers_)
       {
-        process_markers(now_time - vicon_latency, lastFrameNumber);
+        process_markers(frame_time, lastFrameNumber);
       }
 
       lastTime = now_time;

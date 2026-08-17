@@ -105,6 +105,15 @@ struct ModelFrame
   std::vector<RigidBody> rigidBodies;
 
   float latency;
+
+  /// \brief Instant the cameras captured this frame, in seconds since Motive
+  ///        started. Present in every data frame; see TimestampSynchronizer for
+  ///        how it is mapped onto the ROS clock.
+  double timestamp;
+
+  /// \brief False when the server supplied no usable timestamp, in which case
+  ///        the caller must fall back to arrival time.
+  bool hasTimestamp;
 };
 
 /// \brief Data object holding server info

@@ -1,20 +1,28 @@
 cmake_minimum_required(VERSION 3.0.2)
 project(mocap_optitrack)
 
-# Require c++11
+# C++11 is the minimum this package needs, but it cannot be pinned to it: on
+# current Noetic systems log4cxx (reached through ros/console.h) uses
+# std::shared_mutex and so requires C++17. Prefer the newer standard where the
+# compiler offers it and fall back only for older toolchains.
 include(CheckCXXCompilerFlag)
+CHECK_CXX_COMPILER_FLAG("-std=c++17" COMPILER_SUPPORTS_CXX17)
 CHECK_CXX_COMPILER_FLAG("-std=c++11" COMPILER_SUPPORTS_CXX11)
-if(COMPILER_SUPPORTS_CXX11)
-    set(CMAKE_CXX_FLAGS "-std=c++11")
+if(COMPILER_SUPPORTS_CXX17)
+    set(CMAKE_CXX_STANDARD 17)
+elseif(COMPILER_SUPPORTS_CXX11)
+    set(CMAKE_CXX_STANDARD 11)
 else()
     message(FATAL_ERROR "The compiler ${CMAKE_CXX_COMPILER} has no C++11 support. Please use a different C++ compiler.")
 endif()
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(catkin REQUIRED COMPONENTS 
+find_package(catkin REQUIRED COMPONENTS
   roscpp
   geometry_msgs
   nav_msgs
   dynamic_reconfigure
+  std_msgs
   tf)
 
 # dynamic reconfigure
@@ -49,4 +57,16 @@ if (CATKIN_ENABLE_TESTING)
   set(ROSLINT_CPP_OPTS "--filter=-runtime/string,-readability/casting,-runtime/references")
   roslint_cpp(${LINT_SRCS})
   roslint_add_test()
+
+  catkin_add_gtest(test_timestamp_sync test/test_timestamp_sync.cpp)
+  target_link_libraries(test_timestamp_sync ${catkin_LIBRARIES})
+
+  catkin_add_gtest(test_natnet_timestamp
+    test/test_natnet_timestamp.cpp
+    src/natnet/natnet_messages.cpp
+    src/natnet/natnet_packet_definition.cpp
+    src/data_model.cpp
+    src/version.cpp)
+  target_include_directories(test_natnet_timestamp PRIVATE src)
+  target_link_libraries(test_natnet_timestamp ${catkin_LIBRARIES})
 endif()
