@@ -154,13 +154,25 @@ int UdpMulticastSocket::recv()
 
   sockaddr_in remote_addr;
   int addr_len = sizeof(struct sockaddr);
+  // MSG_TRUNC makes the return value the true datagram length rather than the
+  // number of bytes copied, which is the only way to notice that a datagram was
+  // larger than the buffer. Without it an oversized frame is delivered with its
+  // tail silently removed and looks like a valid short frame.
   int status = recvfrom(
                  m_socket,
                  buf,
                  MAXRECV,
-                 0,
+                 MSG_TRUNC,
                  (sockaddr *)&remote_addr,
                  (socklen_t*)&addr_len);
+
+  if (status > MAXRECV)
+  {
+    ROS_WARN_THROTTLE(5.0,
+      "Received a %i byte datagram but the buffer holds %i; the frame was "
+      "truncated and is being discarded.", status, MAXRECV);
+    return -1;
+  }
 
   if (status > 0)
     ROS_DEBUG("%4i bytes received from %s:%i", status, inet_ntoa(remote_addr.sin_addr), ntohs(remote_addr.sin_port));

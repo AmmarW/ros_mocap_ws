@@ -29,12 +29,117 @@
 #ifndef __MOCAP_OPTITRACK_NATNET_MESSAGES_H__
 #define __MOCAP_OPTITRACK_NATNET_MESSAGES_H__
 
+#include <cstddef>
+#include <cstring>
 #include <vector>
 #include <mocap_optitrack/data_model.h>
 
 namespace natnet
 {
     typedef std::vector<char> MessageBuffer;
+
+    /// \brief Bounds checked cursor over a received message.
+    ///
+    /// Packet contents are attacker- or fault-controlled in the sense that a
+    /// truncated datagram, a version mismatch or a corrupted field can all make
+    /// the declared structure disagree with the bytes actually present. Reading
+    /// through a bare iterator walks off the end of the buffer when that
+    /// happens. This cursor refuses to read past the end, latches the fact that
+    /// it happened, and turns every subsequent read into a no-op so a caller can
+    /// parse straight through and check once at the end.
+    class BufferReader
+    {
+    public:
+        explicit BufferReader(MessageBuffer const& buffer)
+          : iter(buffer.begin()), end(buffer.end()), overrun(false)
+        {
+        }
+
+        /// \brief Copy one value out of the buffer and advance past it.
+        /// \return False if there were not enough bytes, leaving target alone.
+        template <typename T>
+        bool read(T& target)
+        {
+            if (overrun || remaining() < sizeof(T))
+            {
+                overrun = true;
+                return false;
+            }
+            std::memcpy(&target, &(*iter), sizeof(T));
+            iter += sizeof(T);
+            return true;
+        }
+
+        /// \brief Advance without reading.
+        bool skip(std::size_t bytes)
+        {
+            if (overrun || remaining() < bytes)
+            {
+                overrun = true;
+                return false;
+            }
+            iter += bytes;
+            return true;
+        }
+
+        /// \brief Copy a null terminated string, which the wire format uses for
+        ///        names, refusing to run past the end if the terminator is absent.
+        bool readString(char* dest, std::size_t destSize)
+        {
+            if (overrun || destSize == 0)
+            {
+                overrun = true;
+                return false;
+            }
+
+            std::size_t length = 0;
+            while (length < remaining() && iter[length] != '\0')
+            {
+                ++length;
+            }
+
+            // No terminator inside the buffer, or no room for the copy.
+            if (length >= remaining() || length + 1 > destSize)
+            {
+                overrun = true;
+                return false;
+            }
+
+            std::memcpy(dest, &(*iter), length + 1);
+            iter += length + 1;
+            return true;
+        }
+
+        /// \brief False once any read has run past the end of the buffer.
+        bool ok() const
+        {
+            return !overrun;
+        }
+
+        std::size_t remaining() const
+        {
+            return overrun ? 0u : static_cast<std::size_t>(end - iter);
+        }
+
+        /// \brief Whether count items of itemSize bytes could still fit.
+        ///
+        /// Element counts are read from the packet itself, so a corrupted one
+        /// can ask for billions of items. Checking before looping keeps a bad
+        /// count from turning into a very long loop over failing reads.
+        bool canHold(int count, std::size_t itemSize) const
+        {
+            if (count < 0)
+            {
+                return false;
+            }
+            return static_cast<std::size_t>(count) <= remaining() / (itemSize ? itemSize : 1);
+        }
+
+    private:
+        MessageBuffer::const_iterator iter;
+        MessageBuffer::const_iterator end;
+        bool overrun;
+    };
 
     struct MessageInterface
     {
@@ -56,7 +161,7 @@ namespace natnet
     {
         struct RigidBodyMessagePart
         {
-            void deserialize(MessageBuffer::const_iterator&, 
+            void deserialize(BufferReader&,
                 mocap_optitrack::RigidBody&,
                 mocap_optitrack::Version const&);
         };

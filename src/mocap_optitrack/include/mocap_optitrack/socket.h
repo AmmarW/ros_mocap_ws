@@ -56,8 +56,13 @@ class UdpMulticastSocket
 {
 public:
 
-  /// \brief Maximum number of bytse that can be read at a time
-  static const int MAXRECV = 3000;
+  /// \brief Maximum number of bytes that can be read at a time.
+  ///
+  /// Sized to the largest UDP payload, so a data frame is never truncated
+  /// regardless of how many markers, rigid bodies or devices the server is
+  /// streaming. A smaller buffer silently discards the tail of a large frame,
+  /// which the deserializer cannot distinguish from a short one.
+  static const int MAXRECV = 65507;
 
   /// Creates a socket and joins the multicast group with the given address
   UdpMulticastSocket(const int local_port, const std::string multicast_ip = "224.0.0.1");

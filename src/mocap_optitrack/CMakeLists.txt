@@ -69,4 +69,13 @@ if (CATKIN_ENABLE_TESTING)
     src/version.cpp)
   target_include_directories(test_natnet_timestamp PRIVATE src)
   target_link_libraries(test_natnet_timestamp ${catkin_LIBRARIES})
+
+  catkin_add_gtest(test_natnet_bounds
+    test/test_natnet_bounds.cpp
+    src/natnet/natnet_messages.cpp
+    src/natnet/natnet_packet_definition.cpp
+    src/data_model.cpp
+    src/version.cpp)
+  target_include_directories(test_natnet_bounds PRIVATE src)
+  target_link_libraries(test_natnet_bounds ${catkin_LIBRARIES})
 endif()

@@ -32,6 +32,8 @@
 #include <cstring>
 #include <vector>
 
+#include <ros/time.h>
+
 #include <mocap_optitrack/data_model.h>
 #include <mocap_optitrack/timestamp_sync.h>
 
@@ -217,5 +219,8 @@ TEST(NatNetTimestamp, BurstyDeliveryStillYieldsUniformPublishedIntervals)
 int main(int argc, char** argv)
 {
   testing::InitGoogleTest(&argc, argv);
+  // The deserializer logs through throttled macros, which read the ROS clock.
+  // Nothing here runs a node, so the clock has to be started by hand.
+  ros::Time::init();
   return RUN_ALL_TESTS();
 }

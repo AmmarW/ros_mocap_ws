@@ -40,25 +40,6 @@ namespace natnet
 
 namespace utilities
 {
-  void seek(MessageBuffer::const_iterator& iter, size_t offset)
-  {
-    iter += offset;
-  }
-
-  template <typename T> 
-  void read_and_seek(MessageBuffer::const_iterator& iter, T& target)
-  {
-    // Breaking up the steps for clarity.
-    //    *iter <- points to current value (const char) in message buffer
-    //    &(*iter) <- return address of this const char (char const*)
-    //    (T const*) pData <- casts char const* into T const*
-    //    *((T const*) pData) <- dereference typed pointer and copy it into target
-    char const* pData = &(*iter);
-    target = *((T const*) pData);
-    // ROS_DEBUG("\t sizeof(%s) = %d", TypeParseTraits<T>::name, (int)sizeof(T));
-    seek(iter, sizeof(T));
-  }
-
   void decode_marker_id(int sourceID, int& pOutEntityID, int& pOutMemberID)
   {
       if (pOutEntityID)
@@ -118,6 +99,15 @@ void ServerInfoMessage::deserialize(
   MessageBuffer const& msgBuffer, 
   mocap_optitrack::DataModel* dataModel)
 {
+  // The sender block is fixed size, so anything shorter cannot carry one.
+  size_t const minimumSize = 4 + sizeof(natnet::Sender);
+  if (msgBuffer.size() < minimumSize)
+  {
+    ROS_WARN("Ignoring server info message of %zu bytes; %zu are required.",
+             msgBuffer.size(), minimumSize);
+    return;
+  }
+
   char const* pBuffer = &msgBuffer[0];
   natnet::Packet const* packet = (natnet::Packet const*)pBuffer;
 
@@ -133,13 +123,13 @@ void ServerInfoMessage::deserialize(
 
 
 void DataFrameMessage::RigidBodyMessagePart::deserialize(
-  MessageBuffer::const_iterator& msgBufferIter, 
+  BufferReader& reader,
   mocap_optitrack::RigidBody& rigidBody,
   mocap_optitrack::Version const& natNetVersion)
 {
   // Read id, position and orientation of each rigid body
-  utilities::read_and_seek(msgBufferIter, rigidBody.bodyId);
-  utilities::read_and_seek(msgBufferIter, rigidBody.pose);
+  reader.read(rigidBody.bodyId);
+  reader.read(rigidBody.pose);
 
   ROS_DEBUG("  Rigid body ID: %d", rigidBody.bodyId);
   ROS_DEBUG("    Pos: [%3.2f,%3.2f,%3.2f], Ori: [%3.2f,%3.2f,%3.2f,%3.2f]",
@@ -155,7 +145,7 @@ void DataFrameMessage::RigidBodyMessagePart::deserialize(
   if (natNetVersion >= mocap_optitrack::Version("2.0"))
   {
     // Mean marker error
-    utilities::read_and_seek(msgBufferIter, rigidBody.meanMarkerError);
+    reader.read(rigidBody.meanMarkerError);
     ROS_DEBUG("    Mean marker error: %3.2f", rigidBody.meanMarkerError);
   }
 
@@ -163,8 +153,8 @@ void DataFrameMessage::RigidBodyMessagePart::deserialize(
   if (natNetVersion >= mocap_optitrack::Version("2.6"))
   {
     // params
-    short params = 0; 
-    utilities::read_and_seek(msgBufferIter, params);
+    short params = 0;
+    reader.read(params);
     rigidBody.isTrackingValid = params & 0x01; // 0x01 : rigid body was successfully tracked in this frame
     ROS_DEBUG("    Successfully tracked in this frame: %s", 
       (rigidBody.isTrackingValid ? "YES" : "NO"));
@@ -176,12 +166,16 @@ void DataFrameMessage::deserialize(
   MessageBuffer const& msgBuffer, 
   mocap_optitrack::DataModel* dataModel)
 {
-  // Get iterator to beginning of buffer and skip the header
-  MessageBuffer::const_iterator msgBufferIter = msgBuffer.begin();
-  utilities::seek(msgBufferIter, 4); // Skip the header (4 bytes)
+  // Every read below is bounds checked. Rather than test each one, parsing runs
+  // straight through - reads become no-ops once the end is passed - and the
+  // result is checked once at the bottom. Element counts come out of the packet
+  // itself, so each is validated against the bytes remaining before it is used
+  // to size a container or drive a loop.
+  BufferReader reader(msgBuffer);
+  reader.skip(4);   // message id and payload length
 
   // Next 4 bytes is the frame number
-  utilities::read_and_seek(msgBufferIter, dataModel->frameNumber);
+  reader.read(dataModel->frameNumber);
   ROS_DEBUG("=== BEGIN DATA FRAME ===");
   ROS_DEBUG("Frame number: %d", dataModel->frameNumber);
 
@@ -192,9 +186,16 @@ void DataFrameMessage::deserialize(
 
   // Next 4 bytes is the number of data sets (markersets, rigidbodies, etc)
   int numMarkerSets = 0;
-  utilities::read_and_seek(msgBufferIter, numMarkerSets);
+  reader.read(numMarkerSets);
   ROS_DEBUG("*** MARKER SETS ***");
   ROS_DEBUG("Marker set count: %d", numMarkerSets);
+  // A marker set costs at least a terminator plus a marker count.
+  if (!reader.canHold(numMarkerSets, sizeof(int) + 1))
+  {
+    ROS_WARN_THROTTLE(5.0, "Discarding malformed data frame: marker set count "
+      "%d exceeds the received packet.", numMarkerSets);
+    return;
+  }
   dataFrame->markerSets.resize(numMarkerSets);
 
   // Loop through number of marker sets and get name and data
@@ -203,22 +204,28 @@ void DataFrameMessage::deserialize(
   for (auto& markerSet : dataFrame->markerSets)
   {
     // Markerset name
-    strcpy(markerSet.name, &(*msgBufferIter));
-    utilities::seek(msgBufferIter, strlen(markerSet.name) + 1);
+    if (!reader.readString(markerSet.name, sizeof(markerSet.name)))
+    {
+      break;
+    }
     ROS_DEBUG("  Marker set %d: %s", icnt++, markerSet.name);
 
     // Read number of markers that belong to the model
     int numMarkers = 0;
-    utilities::read_and_seek(msgBufferIter, numMarkers);
-    markerSet.markers.resize(numMarkers);
+    reader.read(numMarkers);
     ROS_DEBUG("  Number of markers: %d", numMarkers);
+    if (!reader.canHold(numMarkers, sizeof(mocap_optitrack::Marker)))
+    {
+      break;
+    }
+    markerSet.markers.resize(numMarkers);
 
     int jcnt = 0;
     for (auto& marker : markerSet.markers)
     {
       // read marker positions
-      utilities::read_and_seek(msgBufferIter, marker);
-      ROS_DEBUG("    Marker %d: [x=%3.2f,y=%3.2f,z=%3.2f]", 
+      reader.read(marker);
+      ROS_DEBUG("    Marker %d: [x=%3.2f,y=%3.2f,z=%3.2f]",
         jcnt++, marker.x, marker.y, marker.z);
     }
   }
@@ -226,17 +233,23 @@ void DataFrameMessage::deserialize(
   // Loop through unlabeled markers
   ROS_DEBUG("*** UNLABELED MARKERS (Deprecated) ***");
   int numUnlabeledMarkers = 0;
-  utilities::read_and_seek(msgBufferIter, numUnlabeledMarkers);
-  dataFrame->otherMarkers.resize(numUnlabeledMarkers);
+  reader.read(numUnlabeledMarkers);
   ROS_DEBUG("Unlabled marker count: %d", numUnlabeledMarkers);
+  if (!reader.canHold(numUnlabeledMarkers, sizeof(mocap_optitrack::Marker)))
+  {
+    ROS_WARN_THROTTLE(5.0, "Discarding malformed data frame: unlabeled marker "
+      "count %d exceeds the received packet.", numUnlabeledMarkers);
+    return;
+  }
+  dataFrame->otherMarkers.resize(numUnlabeledMarkers);
 
   // Loop over unlabled markers
   icnt = 0;
   for (auto& marker : dataFrame->otherMarkers)
   {
     // read positions of 'other' markers
-    utilities::read_and_seek(msgBufferIter, marker);
-    ROS_DEBUG("  Marker %d: [x=%3.2f,y=%3.2f,z=%3.2f]", 
+    reader.read(marker);
+    ROS_DEBUG("  Marker %d: [x=%3.2f,y=%3.2f,z=%3.2f]",
         icnt++, marker.x, marker.y, marker.z);
     // Deprecated
   }
@@ -244,15 +257,23 @@ void DataFrameMessage::deserialize(
   // Loop through rigidbodies
   ROS_DEBUG("*** RIGID BODIES ***");
   int numRigidBodies = 0;
-  utilities::read_and_seek(msgBufferIter, numRigidBodies);
-  dataFrame->rigidBodies.resize(numRigidBodies);
+  reader.read(numRigidBodies);
   ROS_DEBUG("Rigid count: %d", numRigidBodies);
+  // Id and pose are the smallest a rigid body can be, on the oldest version.
+  if (!reader.canHold(numRigidBodies,
+                      sizeof(int) + sizeof(mocap_optitrack::Pose)))
+  {
+    ROS_WARN_THROTTLE(5.0, "Discarding malformed data frame: rigid body count "
+      "%d exceeds the received packet.", numRigidBodies);
+    return;
+  }
+  dataFrame->rigidBodies.resize(numRigidBodies);
 
   // Loop over rigid bodies
   for (auto& rigidBody : dataFrame->rigidBodies)
   {
     DataFrameMessage::RigidBodyMessagePart rigidBodyMessagePart;
-    rigidBodyMessagePart.deserialize(msgBufferIter, rigidBody, dataModel->getNatNetVersion());
+    rigidBodyMessagePart.deserialize(reader, rigidBody, dataModel->getNatNetVersion());
   }
 
   // Skeletons (NatNet version 2.1 and later)
@@ -262,28 +283,28 @@ void DataFrameMessage::deserialize(
   {
     ROS_DEBUG("*** SKELETONS ***");
     int numSkeletons = 0;
-    utilities::read_and_seek(msgBufferIter, numSkeletons);
+    reader.read(numSkeletons);
     ROS_DEBUG("Skeleton count: %d", numSkeletons);
 
     // Loop through skeletons
-    for (int j=0; j < numSkeletons; j++)
+    for (int j=0; j < numSkeletons && reader.ok(); j++)
     {
       // skeleton id
       int skeletonId = 0;
-      utilities::read_and_seek(msgBufferIter, skeletonId);
+      reader.read(skeletonId);
       ROS_DEBUG("Skeleton ID: %d", skeletonId);
 
       // Number of rigid bodies (bones) in skeleton
       int numRigidBodies = 0;
-      utilities::read_and_seek(msgBufferIter, numRigidBodies);
+      reader.read(numRigidBodies);
       ROS_DEBUG("Rigid body count: %d", numRigidBodies);
 
       // Loop through rigid bodies (bones) in skeleton
-      for (int j=0; j < numRigidBodies; j++)
+      for (int j=0; j < numRigidBodies && reader.ok(); j++)
       {
         mocap_optitrack::RigidBody rigidBody;
         DataFrameMessage::RigidBodyMessagePart rigidBodyMessagePart;
-        rigidBodyMessagePart.deserialize(msgBufferIter, rigidBody, NatNetVersion);
+        rigidBodyMessagePart.deserialize(reader, rigidBody, NatNetVersion);
       } // next rigid body
     } // next skeleton
   }
@@ -295,28 +316,28 @@ void DataFrameMessage::deserialize(
   {
     ROS_DEBUG("*** LABELED MARKERS ***");
     int numLabeledMarkers = 0;
-    utilities::read_and_seek(msgBufferIter, numLabeledMarkers);
+    reader.read(numLabeledMarkers);
     ROS_DEBUG("Labeled marker count: %d", numLabeledMarkers);
 
     // Loop through labeled markers
-    for (int j=0; j < numLabeledMarkers; j++)
+    for (int j=0; j < numLabeledMarkers && reader.ok(); j++)
     {
       int id = 0; 
-      utilities::read_and_seek(msgBufferIter, id);
+      reader.read(id);
       int modelId, markerId;
       utilities::decode_marker_id(id, modelId, markerId);
 
       mocap_optitrack::Marker marker;
-      utilities::read_and_seek(msgBufferIter, marker);
+      reader.read(marker);
       
       float size;
-      utilities::read_and_seek(msgBufferIter, size);
+      reader.read(size);
 
       if (NatNetVersion >= mocap_optitrack::Version("2.6"))
       {
         // marker params
         short params = 0;
-        utilities::read_and_seek(msgBufferIter, params);
+        reader.read(params);
         // marker was not visible (occluded) in this frame
         bool bOccluded = (params & 0x01) != 0;
         // position provided by point cloud solve     
@@ -344,7 +365,7 @@ void DataFrameMessage::deserialize(
       {
         // Marker residual
         float residual = 0.0f;
-        utilities::read_and_seek(msgBufferIter, residual);
+        reader.read(residual);
         ROS_DEBUG("    Residual:  %3.2f", residual);
       }
     }
@@ -356,30 +377,30 @@ void DataFrameMessage::deserialize(
   {
     ROS_DEBUG("*** FORCE PLATES ***");
     int numForcePlates;
-    utilities::read_and_seek(msgBufferIter, numForcePlates);
+    reader.read(numForcePlates);
     ROS_DEBUG("Force plate count: %d", numForcePlates);
-    for (int iForcePlate = 0; iForcePlate < numForcePlates; iForcePlate++)
+    for (int iForcePlate = 0; iForcePlate < numForcePlates && reader.ok(); iForcePlate++)
     {
         // ID
         int forcePlateId = 0;
-        utilities::read_and_seek(msgBufferIter, forcePlateId);
+        reader.read(forcePlateId);
         ROS_DEBUG("Force plate ID: %d", forcePlateId);
 
         // Channel Count
         int numChannels = 0; 
-        utilities::read_and_seek(msgBufferIter, numChannels);
+        reader.read(numChannels);
         ROS_DEBUG("  Number of channels: %d", numChannels);
 
         // Channel Data
-        for (int i = 0; i < numChannels; i++)
+        for (int i = 0; i < numChannels && reader.ok(); i++)
         {
             ROS_DEBUG("    Channel %d: ", i);
             int numFrames = 0;
-            utilities::read_and_seek(msgBufferIter, numFrames);
-            for (int j = 0; j < numFrames; j++)
+            reader.read(numFrames);
+            for (int j = 0; j < numFrames && reader.ok(); j++)
             {
                 float val = 0.0f;  
-                utilities::read_and_seek(msgBufferIter, val);
+                reader.read(val);
                 ROS_DEBUG("      Frame %d: %3.2f", j, val);
             }
         }
@@ -392,30 +413,30 @@ void DataFrameMessage::deserialize(
   {
     ROS_DEBUG("*** DEVICE DATA ***");
     int numDevices;
-    utilities::read_and_seek(msgBufferIter, numDevices);
+    reader.read(numDevices);
     ROS_DEBUG("Device count: %d", numDevices);
 
-    for (int iDevice = 0; iDevice < numDevices; iDevice++)
+    for (int iDevice = 0; iDevice < numDevices && reader.ok(); iDevice++)
     {
       // ID
       int deviceId = 0;
-      utilities::read_and_seek(msgBufferIter, deviceId);
+      reader.read(deviceId);
       ROS_DEBUG("  Device ID: %d", deviceId);
 
       // Channel Count
       int numChannels = 0;
-      utilities::read_and_seek(msgBufferIter, numChannels);
+      reader.read(numChannels);
 
       // Channel Data
-      for (int i = 0; i < numChannels; i++)
+      for (int i = 0; i < numChannels && reader.ok(); i++)
       {
         ROS_DEBUG("    Channel %d: ", i);
-        int nFrames = 0; 
-        utilities::read_and_seek(msgBufferIter, nFrames);
-        for (int j = 0; j < nFrames; j++)
+        int nFrames = 0;
+        reader.read(nFrames);
+        for (int j = 0; j < nFrames && reader.ok(); j++)
         {
             float val = 0.0f;
-            utilities::read_and_seek(msgBufferIter, val);
+            reader.read(val);
             ROS_DEBUG("      Frame %d: %3.2f", j, val);
         }
       }
@@ -426,15 +447,15 @@ void DataFrameMessage::deserialize(
   ROS_DEBUG("*** DIAGNOSTICS ***");
   if (NatNetVersion < mocap_optitrack::Version("3.0"))
   {
-    utilities::read_and_seek(msgBufferIter, dataFrame->latency);
+    reader.read(dataFrame->latency);
     ROS_DEBUG("Software latency : %3.3f", dataFrame->latency);
   }
 
   // timecode
   unsigned int timecode = 0;
-  utilities::read_and_seek(msgBufferIter, timecode);
+  reader.read(timecode);
   unsigned int timecodeSub = 0;
-  utilities::read_and_seek(msgBufferIter, timecodeSub);
+  reader.read(timecodeSub);
   char szTimecode[128] = "";
   utilities::stringify_timecode(timecode, timecodeSub, szTimecode, 128);
 
@@ -444,12 +465,12 @@ void DataFrameMessage::deserialize(
   // NatNet version 2.7 and later - increased from single to double precision
   if (NatNetVersion >= mocap_optitrack::Version("2.7"))
   {
-    utilities::read_and_seek(msgBufferIter, timestamp);
+    reader.read(timestamp);
   }
   else
   {
     float fTimestamp = 0.0f;
-    utilities::read_and_seek(msgBufferIter, fTimestamp);
+    reader.read(fTimestamp);
     timestamp = (double)fTimestamp;
   }
   ROS_DEBUG("Timestamp: %3.3f", timestamp);
@@ -466,29 +487,62 @@ void DataFrameMessage::deserialize(
   if (NatNetVersion >= mocap_optitrack::Version("3.0"))
   {
     uint64_t cameraMidExposureTimestamp = 0;
-    utilities::read_and_seek(msgBufferIter, cameraMidExposureTimestamp);
+    reader.read(cameraMidExposureTimestamp);
     ROS_DEBUG("Mid-exposure timestamp: %" PRIu64 "", cameraMidExposureTimestamp);
 
     uint64_t cameraDataReceivedTimestamp = 0;
-    utilities::read_and_seek(msgBufferIter, cameraDataReceivedTimestamp);
+    reader.read(cameraDataReceivedTimestamp);
     ROS_DEBUG("Camera data received timestamp: %" PRIu64 "", cameraDataReceivedTimestamp);
 
     uint64_t transmitTimestamp = 0;
-    utilities::read_and_seek(msgBufferIter, transmitTimestamp);
+    reader.read(transmitTimestamp);
     ROS_DEBUG("Transmit timestamp: %" PRIu64 "", transmitTimestamp);
   }
 
   // frame params
   short params = 0;  
-  utilities::read_and_seek(msgBufferIter, params);
+  reader.read(params);
   // 0x01 Motive is recording
   bool bIsRecording = (params & 0x01) != 0;
   // 0x02 Actively tracked model list has changed
   bool bTrackedModelsChanged = (params & 0x02) != 0;
 
   // end of data tag
-  int eod = 0; 
-  utilities::read_and_seek(msgBufferIter, eod);
+  int eod = 0;
+  reader.read(eod);
+
+  // One check for the whole frame. Anything that ran past the end of the buffer
+  // means the packet disagreed with the layout this version expects: a
+  // truncated datagram, a NatNet version mismatch, or corruption. Whatever was
+  // decoded before that point is not trustworthy, so drop the frame rather than
+  // publish a pose built from partial data.
+  if (!reader.ok())
+  {
+    ROS_WARN_THROTTLE(5.0, "Discarding truncated or malformed data frame of %zu "
+      "bytes. If this persists, check that the configured NatNet version "
+      "matches the server.", msgBuffer.size());
+    dataFrame->clear();
+    dataFrame->hasTimestamp = false;
+    return;
+  }
+
+  // Bounds checking only catches a layout that reads too much. The opposite
+  // mismatch, where the applied layout is shorter than the frame, stops early
+  // and leaves bytes over - every field after the point of divergence having
+  // been read from the wrong offset. The end of data tag is the last thing in a
+  // frame, so anything still unread means the layout was wrong and the decoded
+  // poses cannot be trusted, even though nothing overran.
+  if (reader.remaining() != 0)
+  {
+    ROS_WARN_THROTTLE(5.0, "Discarding data frame with %zu unread trailing "
+      "bytes; the NatNet version being applied does not match the server. Set "
+      "the 'version' parameter to match, or leave it unset to negotiate.",
+      reader.remaining());
+    dataFrame->clear();
+    dataFrame->hasTimestamp = false;
+    return;
+  }
+
   ROS_DEBUG("=== END DATA FRAME ===");
 }
 
@@ -497,6 +551,14 @@ void MessageDispatcher::dispatch(
   MessageBuffer const& msgBuffer, 
   mocap_optitrack::DataModel* dataModel)
 {
+  // Every message begins with a two byte id and a two byte payload length.
+  // Indexing a shorter buffer, including an empty one, is undefined.
+  if (msgBuffer.size() < 4)
+  {
+    ROS_WARN_THROTTLE(5.0, "Ignoring runt message of %zu bytes.", msgBuffer.size());
+    return;
+  }
+
   // Grab message ID by casting to a natnet packet type
   char const* pMsgBuffer = &msgBuffer[0];
   natnet::Packet const* packet = (natnet::Packet const*)(pMsgBuffer);
