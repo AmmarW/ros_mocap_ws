@@ -522,10 +522,11 @@ private:
       frameCount += frameDiff;
       if ((frameDiff) > 1)
       {
-        droppedFrameCount += frameDiff;
+        // A step of n leaves n-1 frames unseen, not n: this frame did arrive.
+        droppedFrameCount += frameDiff - 1;
         double droppedFramePct = (double)droppedFrameCount / frameCount * 100;
-        ROS_DEBUG_STREAM(frameDiff << " more (total " << droppedFrameCount << "/" << frameCount << ", "
-            << droppedFramePct << "%) frame(s) dropped. Consider adjusting rates.");
+        ROS_DEBUG_STREAM((frameDiff - 1) << " more (total " << droppedFrameCount << "/" << frameCount
+            << ", " << droppedFramePct << "%) frame(s) dropped. Consider adjusting rates.");
       }
     }
     lastFrameNumber = OutputFrameNum.FrameNumber;
