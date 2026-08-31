@@ -2,8 +2,14 @@
 
 <launch>
 
-  <!-- IP and port on Vicon Windows PC -->
-  <arg name="datastream_hostport" default="10.121.10.13:801"/>
+  <!-- Address and port of the Vicon DataStream server. There is no useful
+       default: an address belonging to one installation is unreachable
+       everywhere else, and the node then blocks with nothing to indicate the
+       host is simply wrong. Pass it explicitly:
+
+         roslaunch vicon_bridge vicon.launch datastream_hostport:=<host>:801
+  -->
+  <arg name="datastream_hostport" default="localhost:801"/>
   <!-- Fixed vicon world frame -->
   <arg name="vicon_world_frame" default="/vicon/world"/>
 
