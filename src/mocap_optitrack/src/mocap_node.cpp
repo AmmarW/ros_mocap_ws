@@ -110,7 +110,8 @@ public:
       // Create socket
       multicastClientSocketPtr.reset(
         new UdpMulticastSocket(serverDescription.dataPort,
-                               serverDescription.multicastIpAddress));
+                               serverDescription.multicastIpAddress,
+                               serverDescription.multicastInterface));
 
       if (!serverDescription.version.empty())
       {
@@ -235,6 +236,9 @@ private:
          << "timestamp_source: \""
          << (useMocapTimestamps ? "mocap_capture_time" : "message_arrival_time") << "\"\n"
          << "multicast_address: \"" << serverDescription.multicastIpAddress << "\"\n"
+         << "multicast_interface: \""
+         << (serverDescription.multicastInterface.empty()
+             ? std::string("auto") : serverDescription.multicastInterface) << "\"\n"
          << "data_port: " << serverDescription.dataPort << "\n"
          << "command_port: " << serverDescription.commandPort << "\n";
 

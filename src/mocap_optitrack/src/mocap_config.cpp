@@ -66,6 +66,7 @@ bool check_and_get_param<std::string>(
 const int ServerDescription::Default::CommandPort = 1510;
 const int ServerDescription::Default::DataPort   = 9000;
 const std::string ServerDescription::Default::MulticastIpAddress = "224.0.0.1";
+const std::string ServerDescription::Default::MulticastInterface = "";
 const bool ServerDescription::Default::EnableOptitrack   = true;
 
 // Param keys
@@ -74,6 +75,7 @@ namespace rosparam
 namespace keys
 {
 const std::string MulticastIpAddress = "optitrack_config/multicast_address";
+const std::string MulticastInterface = "optitrack_config/multicast_interface";
 const std::string CommandPort = "optitrack_config/command_port";
 const std::string DataPort = "optitrack_config/data_port";
 const std::string EnableOptitrack = "optitrack_config/enable_optitrack";
@@ -94,7 +96,8 @@ ServerDescription::ServerDescription() :
   commandPort(ServerDescription::Default::CommandPort),
   dataPort(ServerDescription::Default::DataPort),
   enableOptitrack(ServerDescription::Default::EnableOptitrack),
-  multicastIpAddress(ServerDescription::Default::MulticastIpAddress)
+  multicastIpAddress(ServerDescription::Default::MulticastIpAddress),
+  multicastInterface(ServerDescription::Default::MulticastInterface)
 {}
 
 void NodeConfiguration::fromRosParam(
@@ -111,6 +114,11 @@ void NodeConfiguration::fromRosParam(
   {
     ROS_WARN_STREAM("Could not get multicast address, using default: " <<
                     serverDescription.multicastIpAddress);
+  }
+
+  if (nh.hasParam(rosparam::keys::MulticastInterface))
+  {
+    nh.getParam(rosparam::keys::MulticastInterface, serverDescription.multicastInterface);
   }
 
   if (nh.hasParam(rosparam::keys::CommandPort))

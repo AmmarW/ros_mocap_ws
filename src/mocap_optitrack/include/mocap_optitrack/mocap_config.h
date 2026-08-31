@@ -46,6 +46,7 @@ struct ServerDescription
     static const int CommandPort;
     static const int DataPort;
     static const std::string MulticastIpAddress;
+    static const std::string MulticastInterface;
     static const bool EnableOptitrack;
   };
 
@@ -53,6 +54,12 @@ struct ServerDescription
   int commandPort;
   int dataPort;
   std::string multicastIpAddress;
+
+  /// \brief Address of the local interface to receive multicast on. Empty
+  ///        lets the kernel choose from the route to the group, which on a
+  ///        multi-homed host is not necessarily the mocap network.
+  std::string multicastInterface;
+
   bool enableOptitrack;
   std::vector<int> version;
 };

@@ -37,7 +37,9 @@
 #include <string>
 #include <ros/ros.h>
 
-UdpMulticastSocket::UdpMulticastSocket(const int local_port, const std::string multicast_ip)
+UdpMulticastSocket::UdpMulticastSocket(const int local_port,
+                                       const std::string multicast_ip,
+                                       const std::string local_interface_ip)
 {
   remote_ip_exist = false;
   memset(&HostAddr, 0, sizeof(HostAddr));
@@ -100,8 +102,32 @@ UdpMulticastSocket::UdpMulticastSocket(const int local_port, const std::string m
   // Join multicast group
   struct ip_mreq mreq;
   mreq.imr_multiaddr.s_addr = inet_addr(multicast_ip.c_str());
-  mreq.imr_interface = m_local_addr.sin_addr;
-  ROS_INFO("Joining multicast group %s...", inet_ntoa(mreq.imr_multiaddr));
+
+  // Choosing the interface explicitly matters on a multi-homed host. Left to
+  // the kernel, the group is joined on whichever interface the route to the
+  // group selects, which is normally the one holding the default route rather
+  // than the one carrying the mocap traffic. The stream then never arrives,
+  // with nothing to indicate why.
+  if (local_interface_ip.empty())
+  {
+    mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+    ROS_INFO("Joining multicast group %s on the interface chosen by the route "
+             "to it. Set multicast_interface to pin it to one interface.",
+             multicast_ip.c_str());
+  }
+  else
+  {
+    mreq.imr_interface.s_addr = inet_addr(local_interface_ip.c_str());
+    if (mreq.imr_interface.s_addr == INADDR_NONE)
+    {
+      std::stringstream error;
+      error << "multicast_interface '" << local_interface_ip
+            << "' is not a valid address of a local interface";
+      throw SocketException(error.str().c_str());
+    }
+    ROS_INFO("Joining multicast group %s on interface %s...",
+             multicast_ip.c_str(), local_interface_ip.c_str());
+  }
 
   result = setsockopt(m_socket, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char *)&mreq, sizeof(mreq));
   if (result == -1)
