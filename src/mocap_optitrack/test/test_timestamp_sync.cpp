@@ -210,10 +210,42 @@ TEST(TimestampSynchronizer, NeverEmitsNonMonotonicStamps)
   TimestampSynchronizer sync(kCalibration);
   std::vector<double> stamps = replay(capture, delay, &sync);
 
+  // Strictly greater, not merely non-decreasing. Repeating the previous stamp
+  // yields a zero interval, which breaks differentiation just as surely as a
+  // negative one and would otherwise pass this test.
+  int duplicates = 0;
   for (size_t i = 1; i < stamps.size(); ++i)
   {
-    EXPECT_GE(stamps[i], stamps[i - 1])
-      << "stamp went backwards at " << i;
+    EXPECT_GT(stamps[i], stamps[i - 1])
+      << "stamp failed to advance at " << i;
+    if (stamps[i] == stamps[i - 1])
+    {
+      ++duplicates;
+    }
+  }
+  EXPECT_EQ(0, duplicates) << "published stamps repeated, giving dt == 0";
+}
+
+
+// The late first sample is the case that used to produce repeated stamps: the
+// offset shrank towards the running minimum faster than capture time advanced.
+TEST(TimestampSynchronizer, LateFirstSampleDoesNotStallTheTimeline)
+{
+  int const n = 400;
+  std::vector<double> capture, delay;
+  for (int i = 0; i < n; ++i)
+  {
+    capture.push_back(i * kFramePeriod);
+    delay.push_back(i == 0 ? 0.728 : 0.0002);
+  }
+
+  TimestampSynchronizer sync(kCalibration);
+  std::vector<double> stamps = replay(capture, delay, &sync);
+
+  for (size_t i = 1; i < stamps.size(); ++i)
+  {
+    EXPECT_GT(stamps[i] - stamps[i - 1], 0.0)
+      << "interval " << i << " was not positive while the offset converged";
   }
 }
 

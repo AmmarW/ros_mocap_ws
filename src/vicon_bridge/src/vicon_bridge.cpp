@@ -34,6 +34,8 @@
  *********************************************************************/
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <iostream>
 #include <map>
 #include <unordered_map>
@@ -188,11 +190,12 @@ private:
   bool broadcast_tf_, publish_tf_, publish_markers_;
 
   // Deriving stamps from the Vicon frame counter rather than from arrival time.
-  // See resolveFrameTime() for why, and for why this is off by default.
+  // See resolveFrameTime() for why.
   bool use_frame_timestamps_;
   double frame_rate_hz_;
   double frame_time_offset_;
   double frame_time_last_capture_;
+  double frame_time_last_stamp_;
   unsigned int frame_time_samples_;
 
   bool grab_frames_;
@@ -229,7 +232,8 @@ public:
         lastFrameNumber(0), frameCount(0), droppedFrameCount(0), frame_datum(0), n_markers(0), n_unlabeled_markers(0),
         marker_data_enabled(false), unlabeled_marker_data_enabled(false),
         use_frame_timestamps_(true), frame_rate_hz_(0.0), frame_time_offset_(0.0),
-        frame_time_last_capture_(0.0), frame_time_samples_(0), grab_frames_(false)
+        frame_time_last_capture_(0.0), frame_time_last_stamp_(0.0),
+        frame_time_samples_(0), grab_frames_(false)
   {
     // Diagnostics
     diag_updater.add("ViconReceiver Status", this, &ViconReceiver::diagnostics);
@@ -479,25 +483,37 @@ private:
     double const capture = static_cast<double>(frameNumber) / frame_rate_hz_;
     double const delta = arrival.toSec() - capture;
 
-    // Roughly two seconds of frames spent adopting the running minimum, so an
-    // unlucky first arrival does not offset the whole stream.
+    // Roughly two seconds of frames spent converging on the running minimum, so
+    // an unlucky first arrival does not offset the whole stream.
     unsigned int const calibrationSamples =
       static_cast<unsigned int>(2.0 * frame_rate_hz_);
+    double const elapsed = capture - frame_time_last_capture_;
 
-    if (frame_time_samples_ == 0)
+    // First frame, or the counter went backwards because the system restarted.
+    // Without this the offset would freeze: every bound below is scaled by the
+    // elapsed capture time, which is negative after a reset, so nothing could
+    // move again and stamps would stay stuck in the past indefinitely.
+    if (frame_time_samples_ == 0 || elapsed < 0.0)
     {
       frame_time_offset_ = delta;
+      frame_time_samples_ = 0;
+      frame_time_last_stamp_ = 0.0;
     }
     else if (frame_time_samples_ < calibrationSamples)
     {
-      frame_time_offset_ = std::min(frame_time_offset_, delta);
+      // Converge on a smaller offset, but no faster than half the capture time
+      // elapsed. Adopting it outright would move the stamp backwards by as much
+      // as the offset shrank; capping the rate below 1 keeps every published
+      // interval positive while still correcting a late first arrival quickly.
+      frame_time_offset_ = std::max(std::min(frame_time_offset_, delta),
+                                    frame_time_offset_ - 0.5 * elapsed);
     }
     else
     {
       // Calibrated: allow only enough movement to follow genuine drift between
       // the Vicon host clock and this one (100 ppm), so neither a stalled frame
       // nor a burst can drag the timeline about.
-      double const bound = 1.0e-4 * std::max(0.0, capture - frame_time_last_capture_);
+      double const bound = 1.0e-4 * elapsed;
       frame_time_offset_ = std::max(frame_time_offset_ - bound,
                                     std::min(delta, frame_time_offset_ + bound));
     }
@@ -505,7 +521,18 @@ private:
     ++frame_time_samples_;
     frame_time_last_capture_ = capture;
 
-    return ros::Time(capture + frame_time_offset_);
+    // Backstop. The whole point of stamping from the counter is that the
+    // timeline is ordered, so never emit a stamp that fails to advance; equal
+    // stamps give a zero interval, which is no more usable than a negative one.
+    double stamp = capture + frame_time_offset_;
+    if (frame_time_samples_ > 1 && stamp <= frame_time_last_stamp_)
+    {
+      stamp = std::nextafter(frame_time_last_stamp_,
+                             std::numeric_limits<double>::max());
+    }
+    frame_time_last_stamp_ = stamp;
+
+    return ros::Time(stamp);
   }
 
   bool process_frame()

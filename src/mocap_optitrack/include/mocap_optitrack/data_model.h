@@ -112,8 +112,13 @@ struct ModelFrame
   double timestamp;
 
   /// \brief False when the server supplied no usable timestamp, in which case
-  ///        the caller must fall back to arrival time.
+  ///        the caller must fall back to arrival time. Independent of decoded:
+  ///        a frame can carry sound poses and an untrustworthy timestamp.
   bool hasTimestamp;
+
+  /// \brief True when this frame was decoded far enough to publish. False for
+  ///        a packet that was rejected, and for one that has not been parsed.
+  bool decoded;
 };
 
 /// \brief Data object holding server info

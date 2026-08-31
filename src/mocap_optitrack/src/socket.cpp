@@ -177,8 +177,11 @@ UdpMulticastSocket::~UdpMulticastSocket()
 
 int UdpMulticastSocket::recv()
 {
-  memset(buf, 0, MAXRECV + 1);
-
+  // Deliberately not clearing the buffer. The caller reads exactly the number
+  // of bytes this returns, so stale content beyond that is never looked at,
+  // and this runs in a poll loop thousands of times a second where most calls
+  // return nothing at all. Zeroing the whole buffer each time costs far more
+  // than the receive itself now that it is sized for the largest datagram.
   sockaddr_in remote_addr;
   int addr_len = sizeof(struct sockaddr);
   // MSG_TRUNC makes the return value the true datagram length rather than the

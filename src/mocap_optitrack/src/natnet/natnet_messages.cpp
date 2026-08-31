@@ -194,6 +194,7 @@ void DataFrameMessage::deserialize(
   {
     ROS_WARN_THROTTLE(5.0, "Discarding malformed data frame: marker set count "
       "%d exceeds the received packet.", numMarkerSets);
+    dataFrame->clear();
     return;
   }
   dataFrame->markerSets.resize(numMarkerSets);
@@ -203,10 +204,14 @@ void DataFrameMessage::deserialize(
   int icnt = 0;
   for (auto& markerSet : dataFrame->markerSets)
   {
-    // Markerset name
+    // Markerset name. Breaking out here would leave the cursor mid-structure
+    // and let parsing continue from a misaligned offset, so bail on the frame.
     if (!reader.readString(markerSet.name, sizeof(markerSet.name)))
     {
-      break;
+      ROS_WARN_THROTTLE(5.0, "Discarding data frame with an unterminated or "
+        "oversized marker set name.");
+      dataFrame->clear();
+      return;
     }
     ROS_DEBUG("  Marker set %d: %s", icnt++, markerSet.name);
 
@@ -216,7 +221,10 @@ void DataFrameMessage::deserialize(
     ROS_DEBUG("  Number of markers: %d", numMarkers);
     if (!reader.canHold(numMarkers, sizeof(mocap_optitrack::Marker)))
     {
-      break;
+      ROS_WARN_THROTTLE(5.0, "Discarding malformed data frame: marker count %d "
+        "exceeds the received packet.", numMarkers);
+      dataFrame->clear();
+      return;
     }
     markerSet.markers.resize(numMarkers);
 
@@ -239,6 +247,7 @@ void DataFrameMessage::deserialize(
   {
     ROS_WARN_THROTTLE(5.0, "Discarding malformed data frame: unlabeled marker "
       "count %d exceeds the received packet.", numUnlabeledMarkers);
+    dataFrame->clear();
     return;
   }
   dataFrame->otherMarkers.resize(numUnlabeledMarkers);
@@ -265,6 +274,7 @@ void DataFrameMessage::deserialize(
   {
     ROS_WARN_THROTTLE(5.0, "Discarding malformed data frame: rigid body count "
       "%d exceeds the received packet.", numRigidBodies);
+    dataFrame->clear();
     return;
   }
   dataFrame->rigidBodies.resize(numRigidBodies);
@@ -480,8 +490,13 @@ void DataFrameMessage::deserialize(
   // the true camera frame interval; arrival time is distorted by socket-queue
   // backlog. Motive counts seconds from its own startup, so zero is a legal
   // value for the very first frames and only a negative value is nonsense.
+  // Motive counts seconds since it started, so a plausible value is bounded:
+  // the upper limit is years of uptime. ros::Time throws on an out-of-range
+  // double, and nothing here catches it, so a corrupted field that happened to
+  // survive the layout checks would otherwise terminate the node.
+  double const kMaxPlausibleUptime = 10.0 * 365.0 * 24.0 * 3600.0;
   dataFrame->timestamp = timestamp;
-  dataFrame->hasTimestamp = (timestamp >= 0.0);
+  dataFrame->hasTimestamp = (timestamp >= 0.0 && timestamp < kMaxPlausibleUptime);
 
   // high res timestamps (version 3.0 and later)
   if (NatNetVersion >= mocap_optitrack::Version("3.0"))
@@ -522,7 +537,6 @@ void DataFrameMessage::deserialize(
       "bytes. If this persists, check that the configured NatNet version "
       "matches the server.", msgBuffer.size());
     dataFrame->clear();
-    dataFrame->hasTimestamp = false;
     return;
   }
 
@@ -534,15 +548,21 @@ void DataFrameMessage::deserialize(
   // poses cannot be trusted, even though nothing overran.
   if (reader.remaining() != 0)
   {
-    ROS_WARN_THROTTLE(5.0, "Discarding data frame with %zu unread trailing "
-      "bytes; the NatNet version being applied does not match the server. Set "
-      "the 'version' parameter to match, or leave it unset to negotiate.",
-      reader.remaining());
-    dataFrame->clear();
+    // The rigid bodies are read near the start of a frame, ahead of the
+    // sections that differ between versions, so they are still usable. What
+    // cannot be trusted is everything read after the divergence, including the
+    // timestamp. Drop the timestamp and keep the poses: the caller falls back
+    // to arrival time, which is what this node did before capture stamping
+    // existed. Discarding the frame outright would publish nothing at all
+    // against a server whose layout merely carries a section not modelled here.
+    ROS_WARN_THROTTLE(5.0, "Data frame has %zu unread trailing bytes, so the "
+      "layout being applied does not match the server. Publishing poses with "
+      "arrival time instead of capture time. Set the 'version' parameter to "
+      "match the server, or leave it unset to negotiate.", reader.remaining());
     dataFrame->hasTimestamp = false;
-    return;
   }
 
+  dataFrame->decoded = true;
   ROS_DEBUG("=== END DATA FRAME ===");
 }
 
@@ -578,9 +598,10 @@ bool MessageDispatcher::dispatch(
     DataFrameMessage msg;
     msg.deserialize(msgBuffer, dataModel);
 
-    // deserialize clears the frame and drops the timestamp when it rejects a
-    // packet, so this distinguishes a frame that decoded from one that did not.
-    return dataModel->dataFrame.hasTimestamp;
+    // Whether a frame decoded, not whether its timestamp is trustworthy: a
+    // layout carrying an unmodelled section still yields usable poses, and
+    // those must publish with arrival time rather than not at all.
+    return dataModel->dataFrame.decoded;
   }
 
   if (packet->messageId == natnet::MessageType::ServerInfo)

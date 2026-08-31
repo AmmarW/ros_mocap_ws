@@ -31,6 +31,8 @@
 #define __MOCAP_OPTITRACK_TIMESTAMP_SYNC_H__
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
 
 namespace mocap_optitrack
 {
@@ -49,9 +51,11 @@ namespace mocap_optitrack
 /// the smallest (rosNow - mocapTimestamp) is the least delayed and gives the
 /// best estimate of the true offset. Estimation runs in two phases:
 ///
-///  - Calibration: for the first calibrationSamples frames the running minimum
-///    is adopted directly, so an unlucky first sample (arrival delays of several
-///    hundred ms do occur at startup) is corrected out quickly.
+///  - Calibration: for the first calibrationSamples frames the offset converges
+///    towards the running minimum, so an unlucky first sample (arrival delays of
+///    several hundred ms do occur at startup) is corrected out quickly. The
+///    convergence is rate limited so published stamps keep advancing while it
+///    happens.
 ///  - Tracking: afterwards the offset may only creep, at driftRateLimit
 ///    seconds per second. That is enough to follow genuine crystal drift between
 ///    the two hosts while ignoring per-frame jitter and stalls entirely.
@@ -74,10 +78,16 @@ public:
   ///        offset may move once calibrated. The default of 100 ppm comfortably
   ///        exceeds the drift between two ordinary crystal oscillators while
   ///        distorting the frame interval by only 0.01%.
+  /// \param convergenceRate Fraction of elapsed capture time by which the
+  ///        offset may fall per frame while calibrating. Must be below 1 for
+  ///        published stamps to keep advancing; the default corrects a late
+  ///        first sample within a couple of seconds of data.
   explicit TimestampSynchronizer(int calibrationSamples = 240,
-                                 double driftRateLimit = 1.0e-4)
+                                 double driftRateLimit = 1.0e-4,
+                                 double convergenceRate = 0.5)
     : calibrationSamples(calibrationSamples),
       driftRateLimit(driftRateLimit),
+      convergenceRate(convergenceRate),
       sampleCount(0),
       offsetEstimate(0.0),
       lastMocapTime(0.0),
@@ -103,8 +113,16 @@ public:
     }
     else if (sampleCount < calibrationSamples)
     {
-      // Still calibrating: adopt any smaller offset immediately.
-      offsetEstimate = std::min(offsetEstimate, delta);
+      // Still calibrating: converge towards any smaller offset, but no faster
+      // than convergenceRate of the capture time elapsed. Adopting a smaller
+      // offset outright would move the published stamp backwards by as much as
+      // the offset shrank, and an unlucky first sample can be hundreds of
+      // milliseconds late. Holding the rate below 1 guarantees the stamp still
+      // advances every frame, by at least (1 - convergenceRate) of the true
+      // interval, so nothing downstream ever sees a zero or negative dt.
+      double const elapsed = mocapTimestamp - lastMocapTime;
+      offsetEstimate = std::max(std::min(offsetEstimate, delta),
+                                offsetEstimate - convergenceRate * elapsed);
     }
     else
     {
@@ -119,11 +137,14 @@ public:
     ++sampleCount;
     lastMocapTime = mocapTimestamp;
 
-    // Published stamps must not go backwards even while the offset is settling.
+    // The convergence and drift limits above already keep this increasing.
+    // The guard is kept as a backstop, but it must advance the stamp rather
+    // than repeat the previous one: equal stamps mean a zero interval, which
+    // is no better downstream than one that runs backwards.
     double stamp = mocapTimestamp + offsetEstimate;
     if (initialized && sampleCount > 1 && stamp <= lastRosTime)
     {
-      stamp = lastRosTime;
+      stamp = std::nextafter(lastRosTime, std::numeric_limits<double>::max());
     }
     lastRosTime = stamp;
     return stamp;
@@ -159,6 +180,7 @@ public:
 private:
   int calibrationSamples;
   double driftRateLimit;
+  double convergenceRate;
 
   int sampleCount;
   double offsetEstimate;

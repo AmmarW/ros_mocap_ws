@@ -223,8 +223,12 @@ TEST(NatNetBounds, UnterminatedMarkerSetNameIsRejected)
 
 
 // Version mismatch is the realistic way a well formed packet disagrees with the
-// layout being applied: a 3.0 frame read as 2.0 runs off the end.
-TEST(NatNetBounds, VersionMismatchIsRejectedRatherThanMisparsed)
+// layout being applied. The shorter layout stops early and leaves bytes over,
+// so every field after the divergence, the timestamp included, came from the
+// wrong offset. The poses are read before that point and stay usable, so the
+// frame must still decode while the timestamp is marked untrustworthy: the
+// caller then falls back to arrival time rather than publishing nothing.
+TEST(NatNetBounds, VersionMismatchKeepsPosesButDropsTheTimestamp)
 {
   natnet::MessageBuffer frame = wellFormedFrame(64);
 
@@ -235,7 +239,27 @@ TEST(NatNetBounds, VersionMismatchIsRejectedRatherThanMisparsed)
 
   natnet::MessageDispatcher::dispatch(frame, &model);
 
+  EXPECT_FALSE(model.dataFrame.hasTimestamp)
+    << "a timestamp read at the wrong offset must not be trusted";
+  EXPECT_TRUE(model.dataFrame.decoded)
+    << "poses decoded before the divergence must still be published";
+  EXPECT_EQ(64u, model.dataFrame.rigidBodies.size());
+}
+
+
+// A frame that overran, as opposed to one that merely ended early, has nothing
+// trustworthy in it and must not be published at all.
+TEST(NatNetBounds, OverrunFrameDoesNotDecode)
+{
+  natnet::MessageBuffer full = wellFormedFrame();
+  natnet::MessageBuffer truncated(full.begin(), full.begin() + full.size() / 2);
+
+  mocap_optitrack::DataModel model = makeModel();
+  natnet::MessageDispatcher::dispatch(truncated, &model);
+
+  EXPECT_FALSE(model.dataFrame.decoded);
   EXPECT_FALSE(model.dataFrame.hasTimestamp);
+  EXPECT_TRUE(model.dataFrame.rigidBodies.empty());
 }
 
 
