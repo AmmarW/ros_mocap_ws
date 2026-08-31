@@ -58,9 +58,13 @@ public:
                      ServerDescription const& serverDescr,
                      PublisherConfigurations const& pubConfigs) :
     nh(nh), server(ros::NodeHandle("~/optitrack_config")),
-    initialized(false), useMocapTimestamps(true), measuredRatePublished(false)
+    initialized(false), useMocapTimestamps(true), receivedDataFrame(false),
+    measuredRatePublished(false)
   {
-    server.setCallback(boost::bind(&OptiTrackRosBridge::reconfigureCallback, this, _1, _2));
+    // Everything the reconfigure callback can reach must exist before the
+    // callback can fire. setCallback invokes it synchronously, and it runs
+    // initialize(), which publishes: advertising afterwards would mean
+    // publishing on a default constructed handle.
     serverDescription = serverDescr;
     publisherConfigurations = pubConfigs;
 
@@ -83,6 +87,10 @@ public:
     // else in the stream records what produced it, which leaves later analysis
     // guessing at the capture rate and protocol version it was taken with.
     serverInfoPublisher = nh.advertise<std_msgs::String>("server_info", 1, true);
+
+    // Last: this fires reconfigureCallback synchronously, which initializes and
+    // publishes, so it must come after every publisher above is advertised.
+    server.setCallback(boost::bind(&OptiTrackRosBridge::reconfigureCallback, this, _1, _2));
   }
 
   void reconfigureCallback(MocapOptitrackConfig& config, uint32_t)
@@ -152,10 +160,10 @@ public:
     {
       if (initialized)
       {
-        if (updateDataModelFromServer())
+        if (updateDataModelFromServer() && receivedDataFrame)
         {
-          // Maybe we got some data? If we did it would be in the form of one or more
-          // rigid bodies in the data model
+          // A frame of pose data decoded. Anything else that arrives on this
+          // socket is deliberately not treated as one.
           ros::Time time = resolveFrameTime(dataModel.dataFrame);
           publishDispatcherPtr->publish(time, dataModel.dataFrame.rigidBodies);
 
@@ -351,11 +359,19 @@ private:
 
       // Copy char* buffer into MessageBuffer and dispatch to be deserialized
       natnet::MessageBuffer msgBuffer(pMsgBuffer, pMsgBuffer + numBytesReceived);
-      natnet::MessageDispatcher::dispatch(msgBuffer, &dataModel);
 
+      // Two different questions, and callers need different ones. This returns
+      // whether anything arrived, which is what paces the receive loops: they
+      // must keep draining quickly while messages are queued, or a reply gets
+      // buried behind the frames streaming in ahead of it. Whether a frame of
+      // pose data actually decoded is recorded separately, because server info
+      // replies and rejected packets arrive on this socket too and must not be
+      // stamped and published as though they were frames.
+      receivedDataFrame = natnet::MessageDispatcher::dispatch(msgBuffer, &dataModel);
       return true;
     }
 
+    receivedDataFrame = false;
     return false;
   };
 
@@ -368,6 +384,7 @@ private:
   dynamic_reconfigure::Server<MocapOptitrackConfig> server;
   bool initialized;
   bool useMocapTimestamps;
+  bool receivedDataFrame;
   TimestampSynchronizer timestampSync;
   ros::Publisher frameNumberPublisher;
   FrameStatistics frameStatistics;

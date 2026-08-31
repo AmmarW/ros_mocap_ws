@@ -172,7 +172,11 @@ namespace natnet
 
     struct MessageDispatcher
     {
-        static void dispatch(MessageBuffer const&, mocap_optitrack::DataModel*);
+        /// \brief Decode one received message into the model.
+        /// \return True only when the message was a data frame that decoded
+        ///         successfully. A caller must not treat anything else, such as
+        ///         the server info reply, as a frame of pose data.
+        static bool dispatch(MessageBuffer const&, mocap_optitrack::DataModel*);
     };
 }
 

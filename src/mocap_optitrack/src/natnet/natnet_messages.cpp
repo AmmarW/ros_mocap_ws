@@ -547,8 +547,8 @@ void DataFrameMessage::deserialize(
 }
 
 
-void MessageDispatcher::dispatch(
-  MessageBuffer const& msgBuffer, 
+bool MessageDispatcher::dispatch(
+  MessageBuffer const& msgBuffer,
   mocap_optitrack::DataModel* dataModel)
 {
   // Every message begins with a two byte id and a two byte payload length.
@@ -556,7 +556,7 @@ void MessageDispatcher::dispatch(
   if (msgBuffer.size() < 4)
   {
     ROS_WARN_THROTTLE(5.0, "Ignoring runt message of %zu bytes.", msgBuffer.size());
-    return;
+    return false;
   }
 
   // Grab message ID by casting to a natnet packet type
@@ -568,16 +568,19 @@ void MessageDispatcher::dispatch(
   if (packet->messageId == natnet::MessageType::ModelDef ||
       packet->messageId == natnet::MessageType::FrameOfData)
   {
-    if (dataModel->hasServerInfo())
+    if (!dataModel->hasServerInfo())
     {
-      DataFrameMessage msg;
-      msg.deserialize(msgBuffer, dataModel);
+      ROS_WARN_THROTTLE(5.0,
+        "Client has not received server info request. Parsing data message aborted.");
+      return false;
     }
-    else
-    {
-      ROS_WARN("Client has not received server info request. Parsing data message aborted.");
-    }
-    return;
+
+    DataFrameMessage msg;
+    msg.deserialize(msgBuffer, dataModel);
+
+    // deserialize clears the frame and drops the timestamp when it rejects a
+    // packet, so this distinguishes a frame that decoded from one that did not.
+    return dataModel->dataFrame.hasTimestamp;
   }
 
   if (packet->messageId == natnet::MessageType::ServerInfo)
@@ -586,15 +589,17 @@ void MessageDispatcher::dispatch(
     msg.deserialize(msgBuffer, dataModel);
     ROS_INFO_ONCE("NATNet Version : %s", 
       dataModel->getNatNetVersion().getVersionString().c_str());
-    ROS_INFO_ONCE("Server Version : %s", 
+    ROS_INFO_ONCE("Server Version : %s",
       dataModel->getServerVersion().getVersionString().c_str());
-    return;
+    return false;
   }
 
   if (packet->messageId == natnet::MessageType::UnrecognizedRequest)
   {
     ROS_WARN("Received unrecognized request");
   }
+
+  return false;
 }
 
 
