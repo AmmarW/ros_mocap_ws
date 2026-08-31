@@ -40,6 +40,7 @@
 UdpMulticastSocket::UdpMulticastSocket(const int local_port, const std::string multicast_ip)
 {
   remote_ip_exist = false;
+  memset(&HostAddr, 0, sizeof(HostAddr));
 
   // Create a UDP socket
   ROS_INFO("Creating socket...");
@@ -175,18 +176,36 @@ int UdpMulticastSocket::recv()
   }
 
   if (status > 0)
+  {
     ROS_DEBUG("%4i bytes received from %s:%i", status, inet_ntoa(remote_addr.sin_addr), ntohs(remote_addr.sin_port));
-  else if (status == 0)
-    ROS_DEBUG("Connection closed by peer");
 
-  HostAddr.sin_addr = remote_addr.sin_addr;
-  remote_ip_exist = true;
+    // Only a successful receive leaves remote_addr meaningful. recvfrom does
+    // not touch it when it fails, and on a non-blocking socket failing is the
+    // common case, so recording it unconditionally would overwrite the peer
+    // address with whatever was on the stack. Requests addressed to the server
+    // would then be sent to a junk address, and would do so far more often than
+    // not, since most receive attempts return nothing.
+    HostAddr.sin_addr = remote_addr.sin_addr;
+    remote_ip_exist = true;
+  }
+  else if (status == 0)
+  {
+    ROS_DEBUG("Connection closed by peer");
+  }
 
   return status;
 }
 
 int UdpMulticastSocket::send(const char* buf, unsigned int sz, int port)
 {
+  // The server's address is learned from the frames it streams, so there is
+  // nothing to address until one has arrived. Sending before then would go to
+  // an address that was never set.
+  if (!remote_ip_exist)
+  {
+    return -1;
+  }
+
   HostAddr.sin_family = AF_INET;
   HostAddr.sin_port = htons(port);
   return sendto(m_socket, buf, sz, 0, (sockaddr*)&HostAddr, sizeof(HostAddr));
