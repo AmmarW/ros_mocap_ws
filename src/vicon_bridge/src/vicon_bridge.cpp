@@ -196,7 +196,21 @@ private:
   double frame_time_offset_;
   double frame_time_last_capture_;
   double frame_time_last_stamp_;
+  double frame_time_first_capture_;
+  double frame_time_first_arrival_;
+  /// Ratio of counter advance to wall clock over the last measurement window,
+  /// and whether a window has completed. Reported, never acted upon.
+  double frame_time_rate_ratio_;
+  bool frame_time_rate_measured_;
   unsigned int frame_time_samples_;
+
+  /// Seconds of arrival time observed before the counter rate is checked
+  /// against the reported one, long enough that startup jitter has washed out.
+  static constexpr double kFrameRateCheckSeconds = 3.0;
+  /// Fractional disagreement tolerated between the two before giving up on
+  /// the counter. Comfortably wider than any clock drift, far tighter than the
+  /// several-fold error a wrong rate produces.
+  static constexpr double kFrameRateTolerance = 0.05;
 
   bool grab_frames_;
   // boost::thread grab_frames_thread_;
@@ -233,7 +247,10 @@ public:
         marker_data_enabled(false), unlabeled_marker_data_enabled(false),
         use_frame_timestamps_(true), frame_rate_hz_(0.0), frame_time_offset_(0.0),
         frame_time_last_capture_(0.0), frame_time_last_stamp_(0.0),
-        frame_time_samples_(0), grab_frames_(false)
+        frame_time_first_capture_(0.0), frame_time_first_arrival_(0.0),
+        frame_time_rate_ratio_(1.0), frame_time_rate_measured_(false),
+        frame_time_samples_(0),
+        grab_frames_(false)
   {
     // Diagnostics
     diag_updater.add("ViconReceiver Status", this, &ViconReceiver::diagnostics);
@@ -290,12 +307,42 @@ public:
 private:
   void diagnostics(diagnostic_updater::DiagnosticStatusWrapper& stat)
   {
-    stat.summary(diagnostic_msgs::DiagnosticStatus::OK, "OK");
+    // A frame counter divided by the wrong rate produces a timeline that is
+    // monotonic, evenly spaced and entirely wrong, so it passes every check
+    // made on the stamps themselves. Reporting the counter against a clock not
+    // derived from it is the only way the fault becomes visible, and this is
+    // where an operator will see it.
+    if (use_frame_timestamps_ && frame_rate_hz_ > 0.0 && frame_time_rate_measured_
+        && std::fabs(frame_time_rate_ratio_ - 1.0) > kFrameRateTolerance)
+    {
+      stat.summaryf(diagnostic_msgs::DiagnosticStatus::ERROR,
+                    "Pose timing wrong: counter at %.2f Hz, reported %.2f Hz",
+                    frame_time_rate_ratio_ * frame_rate_hz_, frame_rate_hz_);
+    }
+    else
+    {
+      stat.summary(diagnostic_msgs::DiagnosticStatus::OK, "OK");
+    }
+
     stat.add("latest VICON frame number", lastFrameNumber);
     stat.add("dropped frames", droppedFrameCount);
     stat.add("framecount", frameCount);
     stat.add("# markers", n_markers);
     stat.add("# unlabeled markers", n_unlabeled_markers);
+
+    stat.add("timestamp source", (use_frame_timestamps_ && frame_rate_hz_ > 0.0)
+             ? "vicon frame counter" : "message arrival time");
+    stat.add("reported frame rate (Hz)", frame_rate_hz_);
+    if (frame_time_rate_measured_)
+    {
+      stat.add("measured counter rate (Hz)",
+               frame_time_rate_ratio_ * frame_rate_hz_);
+      stat.add("timeline vs wall clock", frame_time_rate_ratio_);
+    }
+    else
+    {
+      stat.add("measured counter rate (Hz)", "not yet measured");
+    }
   }
 
   bool init_vicon()
@@ -498,6 +545,9 @@ private:
       frame_time_offset_ = delta;
       frame_time_samples_ = 0;
       frame_time_last_stamp_ = 0.0;
+      frame_time_first_capture_ = capture;
+      frame_time_first_arrival_ = arrival.toSec();
+      frame_time_rate_measured_ = false;
     }
     else if (frame_time_samples_ < calibrationSamples)
     {
@@ -520,6 +570,44 @@ private:
 
     ++frame_time_samples_;
     frame_time_last_capture_ = capture;
+
+    // The frame counter only yields a real timeline if the rate it is divided
+    // by is the rate it actually advances at, and nothing guarantees that: the
+    // reported rate is what the system is configured for, not what it is
+    // necessarily producing. Divide by a rate several times too high and
+    // published time runs correspondingly slow, while still looking perfectly
+    // well formed - monotonic, evenly spaced, every interval a whole number of
+    // frames. That is the dangerous failure, because none of the usual checks
+    // catch it; only comparing against a clock that is not derived from the
+    // counter does.
+    //
+    // So measure it and report it, but do not act on it. Switching to arrival
+    // time when the two disagree would mean two clocks with different epochs
+    // and a discontinuity at every transition, which is worse than one clock
+    // that is wrong in a way the diagnostics make obvious. An operator who
+    // knows the true rate sets the 'frame_rate' parameter.
+    double const arrivalSpan = arrival.toSec() - frame_time_first_arrival_;
+    double const captureSpan = capture - frame_time_first_capture_;
+    if (arrivalSpan > kFrameRateCheckSeconds)
+    {
+      frame_time_rate_ratio_ = captureSpan / arrivalSpan;
+      frame_time_rate_measured_ = true;
+
+      if (std::fabs(frame_time_rate_ratio_ - 1.0) > kFrameRateTolerance)
+      {
+        ROS_ERROR_STREAM_THROTTLE(10.0, "Vicon frame counter is advancing at "
+          << frame_time_rate_ratio_ * frame_rate_hz_ << " Hz, not the "
+          << frame_rate_hz_ << " Hz reported, so published stamps are running "
+          "at " << frame_time_rate_ratio_ << " of real time. Pose timing is "
+          "wrong. Set the 'frame_rate' parameter to the rate the system is "
+          "actually producing.");
+      }
+
+      // Restart the measurement window so the reported figure reflects the
+      // current state rather than the whole session.
+      frame_time_first_capture_ = capture;
+      frame_time_first_arrival_ = arrival.toSec();
+    }
 
     // Backstop. The whole point of stamping from the counter is that the
     // timeline is ordered, so never emit a stamp that fails to advance; equal
