@@ -213,6 +213,9 @@ private:
   static constexpr double kFrameRateTolerance = 0.05;
 
   bool grab_frames_;
+  /// Whether the last poll actually produced a frame, so the state can be
+  /// reported rather than inferred from the absence of published poses.
+  bool frames_ok_;
   // boost::thread grab_frames_thread_;
   // std::unordered_map<std::string, ros::Publisher> segment_publishers_;
   SegmentMap segment_publishers_;
@@ -250,7 +253,7 @@ public:
         frame_time_first_capture_(0.0), frame_time_first_arrival_(0.0),
         frame_time_rate_ratio_(1.0), frame_time_rate_measured_(false),
         frame_time_samples_(0),
-        grab_frames_(false)
+        grab_frames_(false), frames_ok_(false)
   {
     // Diagnostics
     diag_updater.add("ViconReceiver Status", this, &ViconReceiver::diagnostics);
@@ -312,7 +315,12 @@ private:
     // made on the stamps themselves. Reporting the counter against a clock not
     // derived from it is the only way the fault becomes visible, and this is
     // where an operator will see it.
-    if (use_frame_timestamps_ && frame_rate_hz_ > 0.0 && frame_time_rate_measured_
+    if (!frames_ok_)
+    {
+      stat.summary(diagnostic_msgs::DiagnosticStatus::ERROR,
+                   "Not receiving frames from the Vicon server");
+    }
+    else if (use_frame_timestamps_ && frame_rate_hz_ > 0.0 && frame_time_rate_measured_
         && std::fabs(frame_time_rate_ratio_ - 1.0) > kFrameRateTolerance)
     {
       stat.summaryf(diagnostic_msgs::DiagnosticStatus::ERROR,
@@ -479,15 +487,28 @@ private:
 
     while (ros::ok() && grab_frames_)
     {
-      while (vicon_client_.GetFrame().Result != Result::Success && ros::ok())
+      // Poll for a frame without blocking the diagnostics. Waiting inside a
+      // nested loop meant the updater below was never reached while frames
+      // were not arriving, so the node fell silent for exactly as long as
+      // something was wrong: no poses, no diagnostics, nothing but a log line.
+      // A consumer could not distinguish that from a healthy but idle system.
+      bool got_frame = vicon_client_.GetFrame().Result == Result::Success;
+      if (!got_frame)
       {
-        ROS_INFO("getFrame returned false");
+        ROS_WARN_THROTTLE(5.0, "No frame from the Vicon server. The connection "
+                          "may have dropped, or the system may have stopped "
+                          "capturing.");
+        frames_ok_ = false;
         d.sleep();
       }
-      now_time = ros::Time::now();
+      else
+      {
+        frames_ok_ = true;
+        now_time = ros::Time::now();
 
-      bool was_new_frame = process_frame();
-      ROS_WARN_COND(!was_new_frame, "grab frame returned false");
+        bool was_new_frame = process_frame();
+        ROS_WARN_COND(!was_new_frame, "grab frame returned false");
+      }
 
       diag_updater.update();
     }
@@ -801,9 +822,13 @@ private:
           Output_GetMarkerGlobalTranslation _Output_GetMarkerGlobalTranslation =
               vicon_client_.GetMarkerGlobalTranslation(this_subject_name, this_marker.marker_name);
 
-          this_marker.translation.x = _Output_GetMarkerGlobalTranslation.Translation[0];
-          this_marker.translation.y = _Output_GetMarkerGlobalTranslation.Translation[1];
-          this_marker.translation.z = _Output_GetMarkerGlobalTranslation.Translation[2];
+          // The SDK reports millimetres. Segment poses are converted to metres
+          // before publishing, so markers must be too: a consumer reading both
+          // topics otherwise gets a silent factor of 1000 between them, and ROS
+          // expresses lengths in metres.
+          this_marker.translation.x = _Output_GetMarkerGlobalTranslation.Translation[0] / 1000;
+          this_marker.translation.y = _Output_GetMarkerGlobalTranslation.Translation[1] / 1000;
+          this_marker.translation.z = _Output_GetMarkerGlobalTranslation.Translation[2] / 1000;
           this_marker.occluded = _Output_GetMarkerGlobalTranslation.Occluded;
 
           markers_msg.markers.push_back(this_marker);
@@ -823,9 +848,9 @@ private:
         if (_Output_GetUnlabeledMarkerGlobalTranslation.Result == Result::Success)
         {
           vicon_bridge::Marker this_marker;
-          this_marker.translation.x = _Output_GetUnlabeledMarkerGlobalTranslation.Translation[0];
-          this_marker.translation.y = _Output_GetUnlabeledMarkerGlobalTranslation.Translation[1];
-          this_marker.translation.z = _Output_GetUnlabeledMarkerGlobalTranslation.Translation[2];
+          this_marker.translation.x = _Output_GetUnlabeledMarkerGlobalTranslation.Translation[0] / 1000;
+          this_marker.translation.y = _Output_GetUnlabeledMarkerGlobalTranslation.Translation[1] / 1000;
+          this_marker.translation.z = _Output_GetUnlabeledMarkerGlobalTranslation.Translation[2] / 1000;
           this_marker.occluded = false; // unlabeled markers can't be occluded
           markers_msg.markers.push_back(this_marker);
         }
