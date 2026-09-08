@@ -3,20 +3,57 @@
 # Identifier corresponds to Trackable ID set in Tracking Tools
 #
 rigid_bodies:
-    '7':
-        pose: warthog/pose
-        # pose2d: warthog/ground_pose
-        odom: warthog/Odom
+    '8':
+        pose: husky/pose
+        # pose2d: husky/ground_pose
+        odom: husky/Odom
         # Tracking quality outputs. Publish these to tell an untracked frame
         # apart from a frame that never arrived: tracking_valid is emitted for
         # every frame, including those that produce no pose.
-        # marker_error: warthog/marker_error
-        # tracking_valid: warthog/tracking_valid
+        marker_error: husky/marker_error
+        tracking_valid: husky/tracking_valid
         # tf: tf
-        # child_frame_id: warthog/base_link
+        # child_frame_id: husky/base_link
         parent_frame_id: world
+    '9':
+        pose: cf2bl/pose
+        # pose2d: husky/ground_pose
+        odom: cf2bl/Odom
+        # Tracking quality outputs. Publish these to tell an untracked frame
+        # apart from a frame that never arrived: tracking_valid is emitted for
+        # every frame, including those that produce no pose.
+        marker_error: cf2bl/marker_error
+        tracking_valid: cf2bl/tracking_valid
+        # tf: tf
+        # child_frame_id: cf2bl/base_link
+        parent_frame_id: world
+    '10':
+        pose: cf21/pose
+        # pose2d: husky/ground_pose
+        odom: cf21/Odom
+        # Tracking quality outputs. Publish these to tell an untracked frame
+        # apart from a frame that never arrived: tracking_valid is emitted for
+        # every frame, including those that produce no pose.
+        marker_error: cf21/marker_error
+        tracking_valid: cf21/tracking_valid
+        # tf: tf
+        # child_frame_id: cf21/base_link
+        parent_frame_id: world
+
+
 optitrack_config:
         multicast_address: 224.0.0.1
+        # Address of the local interface to receive multicast on. Leave unset
+        # to let the kernel pick from the route to the group, which on a host
+        # with more than one interface is usually whichever holds the default
+        # route rather than the one the mocap system is on.
+        multicast_interface: 192.168.1.3
         command_port: 1510
         data_port: 9000
         enable_optitrack: true
+        # Pin the NatNet version to skip the server-info handshake. Needed when
+        # the server streams data but does not answer connection requests, in
+        # which case the node would otherwise wait for a reply forever.
+        version: [4, 0, 0, 0]
+
+
