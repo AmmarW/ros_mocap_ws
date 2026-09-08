@@ -32,6 +32,7 @@
 
 #include <map>
 #include <memory>
+#include <string>
 
 #include <ros/ros.h>
 #include <tf/transform_broadcaster.h>
@@ -62,6 +63,8 @@ private:
   ros::Publisher posePublisher;
   ros::Publisher pose2dPublisher;
   ros::Publisher odomPublisher;
+  ros::Publisher markerErrorPublisher;
+  ros::Publisher trackingValidPublisher;
 };
 
 /// \brief Dispatches RigidBody data to the correct publisher.
@@ -76,6 +79,11 @@ public:
                              Version const& natNetVersion,
                              PublisherConfigurations const& configs);
   void publish(ros::Time const& time, std::vector<RigidBody> const&);
+
+private:
+  /// \brief Comma separated list of the configured rigid body ids, for
+  ///        diagnostics when an unconfigured body arrives.
+  std::string describeConfiguredIds() const;
 };
 
 } // namespace

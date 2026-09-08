@@ -33,6 +33,9 @@ namespace mocap_optitrack
 {
 
 RigidBody::RigidBody() :
+  bodyId(-1),
+  pose(),
+  meanMarkerError(0.0f),
   isTrackingValid(false)
 {
 }
@@ -55,7 +58,10 @@ void MarkerSet::clear()
 
 
 ModelFrame::ModelFrame() :
-  latency(0.0)
+  latency(0.0),
+  timestamp(0.0),
+  hasTimestamp(false),
+  decoded(false)
 {
 }
 
@@ -64,6 +70,9 @@ void ModelFrame::clear()
   markerSets.clear();
   otherMarkers.clear();
   rigidBodies.clear();
+  timestamp = 0.0;
+  hasTimestamp = false;
+  decoded = false;
 }
 
 

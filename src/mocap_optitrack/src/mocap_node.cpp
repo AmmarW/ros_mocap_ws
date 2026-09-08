@@ -33,12 +33,19 @@
 #include <mocap_optitrack/data_model.h>
 #include <mocap_optitrack/mocap_config.h>
 #include <mocap_optitrack/rigid_body_publisher.h>
+#include <mocap_optitrack/timestamp_sync.h>
+#include <mocap_optitrack/frame_statistics.h>
 #include <mocap_optitrack/MocapOptitrackConfig.h>
 #include "natnet/natnet_messages.h"
 
+#include <diagnostic_updater/diagnostic_updater.h>
 #include <dynamic_reconfigure/server.h>
 #include <memory>
 #include <ros/ros.h>
+#include <sstream>
+#include <string>
+#include <std_msgs/String.h>
+#include <std_msgs/UInt32.h>
 
 
 namespace mocap_optitrack
@@ -50,11 +57,40 @@ public:
   OptiTrackRosBridge(ros::NodeHandle& nh,
                      ServerDescription const& serverDescr,
                      PublisherConfigurations const& pubConfigs) :
-    nh(nh), server(ros::NodeHandle("~/optitrack_config"))
+    nh(nh), server(ros::NodeHandle("~/optitrack_config")),
+    initialized(false), useMocapTimestamps(true), receivedDataFrame(false),
+    measuredRatePublished(false)
   {
-    server.setCallback(boost::bind(&OptiTrackRosBridge::reconfigureCallback, this, _1, _2));
+    // Everything the reconfigure callback can reach must exist before the
+    // callback can fire. setCallback invokes it synchronously, and it runs
+    // initialize(), which publishes: advertising afterwards would mean
+    // publishing on a default constructed handle.
     serverDescription = serverDescr;
     publisherConfigurations = pubConfigs;
+
+    // Stamping against Motive's capture time is the correct behaviour, but it
+    // is left switchable: a server that reports no timestamp, or a deployment
+    // that deliberately wants arrival time, can fall back without a rebuild.
+    ros::NodeHandle privateNh("~");
+    privateNh.param("use_mocap_timestamps", useMocapTimestamps, true);
+
+    // The frame counter is the only way a consumer can tell a dropped frame
+    // from a merely delayed one, so it is published alongside the poses.
+    frameNumberPublisher = nh.advertise<std_msgs::UInt32>("frame_number", 1000);
+
+    // Stream health is otherwise only apparent after the fact, from a recording.
+    // Reporting it live lets a degraded run be noticed while it is still running.
+    diagnosticUpdater.setHardwareID("optitrack");
+    diagnosticUpdater.add("Mocap stream", this, &OptiTrackRosBridge::produceDiagnostics);
+
+    // Latched, so a recording started at any point still captures it. Nothing
+    // else in the stream records what produced it, which leaves later analysis
+    // guessing at the capture rate and protocol version it was taken with.
+    serverInfoPublisher = nh.advertise<std_msgs::String>("server_info", 1, true);
+
+    // Last: this fires reconfigureCallback synchronously, which initializes and
+    // publishes, so it must come after every publisher above is advertised.
+    server.setCallback(boost::bind(&OptiTrackRosBridge::reconfigureCallback, this, _1, _2));
   }
 
   void reconfigureCallback(MocapOptitrackConfig& config, uint32_t)
@@ -74,7 +110,8 @@ public:
       // Create socket
       multicastClientSocketPtr.reset(
         new UdpMulticastSocket(serverDescription.dataPort,
-                               serverDescription.multicastIpAddress));
+                               serverDescription.multicastIpAddress,
+                               serverDescription.multicastInterface));
 
       if (!serverDescription.version.empty())
       {
@@ -104,6 +141,12 @@ public:
                                        publisherConfigurations));
       ROS_INFO("Initialization complete");
       initialized = true;
+
+      // Publish what is known now; republished once with the measured capture
+      // rate after enough frames have been seen to estimate it.
+      provenanceStatistics.reset();
+      measuredRatePublished = false;
+      publishServerInfo();
     }
     else
     {
@@ -118,12 +161,18 @@ public:
     {
       if (initialized)
       {
-        if (updateDataModelFromServer())
+        if (updateDataModelFromServer() && receivedDataFrame)
         {
-          // Maybe we got some data? If we did it would be in the form of one or more
-          // rigid bodies in the data model
-          ros::Time time = ros::Time::now();
+          // A frame of pose data decoded. Anything else that arrives on this
+          // socket is deliberately not treated as one.
+          ros::Time time = resolveFrameTime(dataModel.dataFrame);
           publishDispatcherPtr->publish(time, dataModel.dataFrame.rigidBodies);
+
+          std_msgs::UInt32 frameNumberMsg;
+          frameNumberMsg.data = static_cast<uint32_t>(dataModel.frameNumber);
+          frameNumberPublisher.publish(frameNumberMsg);
+
+          accumulateStatistics(time);
 
           // Clear out the model to prepare for the next frame of data
           dataModel.clear();
@@ -135,11 +184,174 @@ public:
       {
         ros::Duration(1.).sleep();
       }
+      // Outside the branch above: a node that never connected is exactly the
+      // case a consumer most needs told about, so diagnostics have to keep
+      // being published when there is no data rather than fall silent.
+      diagnosticUpdater.update();
       ros::spinOnce();
     }
   }
 
 private:
+  /// \brief Decide what time to stamp this frame with.
+  ///
+  /// Arrival time is only a stand-in for capture time when the socket is
+  /// drained promptly. It is not: the receive loop polls, so a queued backlog
+  /// is emitted in a burst and successive frames land far closer together than
+  /// the 1/framerate they were actually captured at. Motive's own timestamp is
+  /// immune to that, so it is preferred whenever the server supplies one.
+  ros::Time resolveFrameTime(ModelFrame const& frame)
+  {
+    ros::Time const now = ros::Time::now();
+
+    if (!useMocapTimestamps || !frame.hasTimestamp)
+    {
+      ROS_WARN_ONCE_NAMED("timestamps",
+        "Stamping mocap poses with arrival time. Intervals between poses will "
+        "not reflect true capture intervals; differentiating them for velocity "
+        "or acceleration will be inaccurate.");
+      return now;
+    }
+
+    ros::Time const stamp(timestampSync.toRosTime(frame.timestamp, now.toSec()));
+
+    ROS_INFO_ONCE_NAMED("timestamps",
+      "Stamping mocap poses with Motive capture time (offset %.6f s).",
+      timestampSync.getOffset());
+
+    return stamp;
+  }
+
+  /// \brief Describe what produced this stream, as a YAML mapping.
+  ///
+  /// A recording of poses alone does not say what protocol version decoded it,
+  /// what rate the system was capturing at, or which clock stamped it, yet all
+  /// three are needed to interpret the data later. Publishing them latched puts
+  /// them in the recording alongside the poses.
+  void publishServerInfo()
+  {
+    std::ostringstream info;
+    info << "natnet_version: \"" << dataModel.getNatNetVersion().getVersionString() << "\"\n"
+         << "server_version: \"" << dataModel.getServerVersion().getVersionString() << "\"\n"
+         << "timestamp_source: \""
+         << (useMocapTimestamps ? "mocap_capture_time" : "message_arrival_time") << "\"\n"
+         << "multicast_address: \"" << serverDescription.multicastIpAddress << "\"\n"
+         << "multicast_interface: \""
+         << (serverDescription.multicastInterface.empty()
+             ? std::string("auto") : serverDescription.multicastInterface) << "\"\n"
+         << "data_port: " << serverDescription.dataPort << "\n"
+         << "command_port: " << serverDescription.commandPort << "\n";
+
+    // Only meaningful once enough frames have been seen to measure it.
+    if (provenanceStatistics.hasData())
+    {
+      info << "measured_capture_rate_hz: "
+           << provenanceStatistics.getCaptureRateHz() << "\n";
+    }
+
+    info << "rigid_body_ids: [";
+    for (size_t i = 0; i < publisherConfigurations.size(); ++i)
+    {
+      info << (i ? ", " : "") << publisherConfigurations[i].rigidBodyId;
+    }
+    info << "]\n";
+
+    std_msgs::String msg;
+    msg.data = info.str();
+    serverInfoPublisher.publish(msg);
+  }
+
+  /// \brief Fold the frame just received into the running stream statistics.
+  void accumulateStatistics(ros::Time const& frameTime)
+  {
+    bool anyTracked = false;
+    double markerErrorSum = 0.0;
+    for (auto const& body : dataModel.dataFrame.rigidBodies)
+    {
+      anyTracked = anyTracked || body.isTrackingValid;
+      markerErrorSum += body.meanMarkerError;
+    }
+    double const meanMarkerError = dataModel.dataFrame.rigidBodies.empty()
+      ? 0.0
+      : markerErrorSum / dataModel.dataFrame.rigidBodies.size();
+
+    frameStatistics.update(dataModel.frameNumber, frameTime.toSec(),
+                           anyTracked, meanMarkerError);
+
+    // A second, never reset accumulator, purely to measure the capture rate
+    // for the provenance message. Republished once when the estimate has had
+    // enough frames to settle; latched, so the last one is what a recording
+    // picks up.
+    if (!measuredRatePublished)
+    {
+      provenanceStatistics.update(dataModel.frameNumber, frameTime.toSec(),
+                                  anyTracked, meanMarkerError);
+      if (provenanceStatistics.getReceivedFrames() >= kRateEstimateFrames)
+      {
+        publishServerInfo();
+        measuredRatePublished = true;
+      }
+    }
+  }
+
+  /// \brief Report stream health, and reset the window so each report covers
+  ///        the interval since the last one rather than the whole session.
+  void produceDiagnostics(diagnostic_updater::DiagnosticStatusWrapper& status)
+  {
+    if (!initialized)
+    {
+      status.summary(diagnostic_msgs::DiagnosticStatus::WARN,
+                     "Not connected to a mocap server");
+      return;
+    }
+
+    if (!frameStatistics.hasData())
+    {
+      status.summary(diagnostic_msgs::DiagnosticStatus::WARN,
+                     "Connected but receiving no frames");
+      frameStatistics.reset();
+      return;
+    }
+
+    double const dropPercent = frameStatistics.getDropPercent();
+    double const untrackedPercent = frameStatistics.getUntrackedPercent();
+
+    if (dropPercent > 5.0)
+    {
+      status.summaryf(diagnostic_msgs::DiagnosticStatus::ERROR,
+                      "Losing %.1f%% of frames", dropPercent);
+    }
+    else if (dropPercent > 1.0)
+    {
+      status.summaryf(diagnostic_msgs::DiagnosticStatus::WARN,
+                      "Losing %.1f%% of frames", dropPercent);
+    }
+    else if (untrackedPercent > 50.0)
+    {
+      status.summaryf(diagnostic_msgs::DiagnosticStatus::WARN,
+                      "No body solved in %.1f%% of frames", untrackedPercent);
+    }
+    else
+    {
+      status.summaryf(diagnostic_msgs::DiagnosticStatus::OK,
+                      "Streaming at %.1f Hz", frameStatistics.getCaptureRateHz());
+    }
+
+    status.add("Capture rate (Hz)", frameStatistics.getCaptureRateHz());
+    status.add("Received rate (Hz)", frameStatistics.getReceivedRateHz());
+    status.add("Frames received", frameStatistics.getReceivedFrames());
+    status.add("Frames dropped", frameStatistics.getDroppedFrames());
+    status.add("Frames dropped (%)", dropPercent);
+    status.add("Largest consecutive gap", frameStatistics.getLargestGap());
+    status.add("Frames with no body solved (%)", untrackedPercent);
+    status.add("Mean marker error", frameStatistics.getMeanMarkerError());
+    status.add("Max marker error", frameStatistics.getMaxMarkerError());
+    status.add("Timestamp source",
+               useMocapTimestamps ? "mocap capture time" : "arrival time");
+
+    frameStatistics.reset();
+  }
+
   bool updateDataModelFromServer()
   {
     // Get data from mocap server
@@ -151,11 +363,19 @@ private:
 
       // Copy char* buffer into MessageBuffer and dispatch to be deserialized
       natnet::MessageBuffer msgBuffer(pMsgBuffer, pMsgBuffer + numBytesReceived);
-      natnet::MessageDispatcher::dispatch(msgBuffer, &dataModel);
 
+      // Two different questions, and callers need different ones. This returns
+      // whether anything arrived, which is what paces the receive loops: they
+      // must keep draining quickly while messages are queued, or a reply gets
+      // buried behind the frames streaming in ahead of it. Whether a frame of
+      // pose data actually decoded is recorded separately, because server info
+      // replies and rejected packets arrive on this socket too and must not be
+      // stamped and published as though they were frames.
+      receivedDataFrame = natnet::MessageDispatcher::dispatch(msgBuffer, &dataModel);
       return true;
     }
 
+    receivedDataFrame = false;
     return false;
   };
 
@@ -167,6 +387,18 @@ private:
   std::unique_ptr<RigidBodyPublishDispatcher> publishDispatcherPtr;
   dynamic_reconfigure::Server<MocapOptitrackConfig> server;
   bool initialized;
+  bool useMocapTimestamps;
+  bool receivedDataFrame;
+  TimestampSynchronizer timestampSync;
+  ros::Publisher frameNumberPublisher;
+  FrameStatistics frameStatistics;
+  diagnostic_updater::Updater diagnosticUpdater;
+  ros::Publisher serverInfoPublisher;
+  FrameStatistics provenanceStatistics;
+  bool measuredRatePublished;
+
+  /// Frames averaged before the measured capture rate is considered settled.
+  static int const kRateEstimateFrames = 600;
 };
 
 }  // namespace mocap_optitrack

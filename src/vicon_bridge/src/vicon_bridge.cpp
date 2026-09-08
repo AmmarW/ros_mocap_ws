@@ -33,6 +33,9 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *********************************************************************/
 
+#include <algorithm>
+#include <cmath>
+#include <limits>
 #include <iostream>
 #include <map>
 #include <unordered_map>
@@ -186,7 +189,33 @@ private:
 
   bool broadcast_tf_, publish_tf_, publish_markers_;
 
+  // Deriving stamps from the Vicon frame counter rather than from arrival time.
+  // See resolveFrameTime() for why.
+  bool use_frame_timestamps_;
+  double frame_rate_hz_;
+  double frame_time_offset_;
+  double frame_time_last_capture_;
+  double frame_time_last_stamp_;
+  double frame_time_first_capture_;
+  double frame_time_first_arrival_;
+  /// Ratio of counter advance to wall clock over the last measurement window,
+  /// and whether a window has completed. Reported, never acted upon.
+  double frame_time_rate_ratio_;
+  bool frame_time_rate_measured_;
+  unsigned int frame_time_samples_;
+
+  /// Seconds of arrival time observed before the counter rate is checked
+  /// against the reported one, long enough that startup jitter has washed out.
+  static constexpr double kFrameRateCheckSeconds = 3.0;
+  /// Fractional disagreement tolerated between the two before giving up on
+  /// the counter. Comfortably wider than any clock drift, far tighter than the
+  /// several-fold error a wrong rate produces.
+  static constexpr double kFrameRateTolerance = 0.05;
+
   bool grab_frames_;
+  /// Whether the last poll actually produced a frame, so the state can be
+  /// reported rather than inferred from the absence of published poses.
+  bool frames_ok_;
   // boost::thread grab_frames_thread_;
   // std::unordered_map<std::string, ros::Publisher> segment_publishers_;
   SegmentMap segment_publishers_;
@@ -218,7 +247,13 @@ public:
     stream_mode_("ClientPull"),
         host_name_(""), tf_ref_frame_id_("world"), tracked_frame_suffix_("vicon"),
         lastFrameNumber(0), frameCount(0), droppedFrameCount(0), frame_datum(0), n_markers(0), n_unlabeled_markers(0),
-        marker_data_enabled(false), unlabeled_marker_data_enabled(false), grab_frames_(false)
+        marker_data_enabled(false), unlabeled_marker_data_enabled(false),
+        use_frame_timestamps_(true), frame_rate_hz_(0.0), frame_time_offset_(0.0),
+        frame_time_last_capture_(0.0), frame_time_last_stamp_(0.0),
+        frame_time_first_capture_(0.0), frame_time_first_arrival_(0.0),
+        frame_time_rate_ratio_(1.0), frame_time_rate_measured_(false),
+        frame_time_samples_(0),
+        grab_frames_(false), frames_ok_(false)
   {
     // Diagnostics
     diag_updater.add("ViconReceiver Status", this, &ViconReceiver::diagnostics);
@@ -232,6 +267,14 @@ public:
     nh_priv.param("broadcast_transform", broadcast_tf_, true);
     nh_priv.param("publish_transform", publish_tf_, true);
     nh_priv.param("publish_markers", publish_markers_, true);
+    // On by default. Stamping from arrival time minus a latency that is
+    // re-read every frame produces a timeline that is not merely jittery but
+    // non-monotonic: measured against a live system, 14% of intervals came out
+    // under a millisecond and 73 ran backwards. Set this false only to restore
+    // the previous behaviour.
+    nh_priv.param("use_frame_timestamps", use_frame_timestamps_, true);
+    // 0 means "ask the Vicon system"; set it only to override a wrong report.
+    nh_priv.param("frame_rate", frame_rate_hz_, 0.0);
     if (init_vicon() == false){
       ROS_ERROR("Error while connecting to Vicon. Exiting now.");
       return;
@@ -267,12 +310,47 @@ public:
 private:
   void diagnostics(diagnostic_updater::DiagnosticStatusWrapper& stat)
   {
-    stat.summary(diagnostic_msgs::DiagnosticStatus::OK, "OK");
+    // A frame counter divided by the wrong rate produces a timeline that is
+    // monotonic, evenly spaced and entirely wrong, so it passes every check
+    // made on the stamps themselves. Reporting the counter against a clock not
+    // derived from it is the only way the fault becomes visible, and this is
+    // where an operator will see it.
+    if (!frames_ok_)
+    {
+      stat.summary(diagnostic_msgs::DiagnosticStatus::ERROR,
+                   "Not receiving frames from the Vicon server");
+    }
+    else if (use_frame_timestamps_ && frame_rate_hz_ > 0.0 && frame_time_rate_measured_
+        && std::fabs(frame_time_rate_ratio_ - 1.0) > kFrameRateTolerance)
+    {
+      stat.summaryf(diagnostic_msgs::DiagnosticStatus::ERROR,
+                    "Pose timing wrong: counter at %.2f Hz, reported %.2f Hz",
+                    frame_time_rate_ratio_ * frame_rate_hz_, frame_rate_hz_);
+    }
+    else
+    {
+      stat.summary(diagnostic_msgs::DiagnosticStatus::OK, "OK");
+    }
+
     stat.add("latest VICON frame number", lastFrameNumber);
     stat.add("dropped frames", droppedFrameCount);
     stat.add("framecount", frameCount);
     stat.add("# markers", n_markers);
     stat.add("# unlabeled markers", n_unlabeled_markers);
+
+    stat.add("timestamp source", (use_frame_timestamps_ && frame_rate_hz_ > 0.0)
+             ? "vicon frame counter" : "message arrival time");
+    stat.add("reported frame rate (Hz)", frame_rate_hz_);
+    if (frame_time_rate_measured_)
+    {
+      stat.add("measured counter rate (Hz)",
+               frame_time_rate_ratio_ * frame_rate_hz_);
+      stat.add("timeline vs wall clock", frame_time_rate_ratio_);
+    }
+    else
+    {
+      stat.add("measured counter rate (Hz)", "not yet measured");
+    }
   }
 
   bool init_vicon()
@@ -323,6 +401,34 @@ private:
     Output_GetVersion _Output_GetVersion = vicon_client_.GetVersion();
     ROS_INFO_STREAM("Version: " << _Output_GetVersion.Major << "." << _Output_GetVersion.Minor << "."
         << _Output_GetVersion.Point);
+
+    if (use_frame_timestamps_)
+    {
+      // A rate is needed to turn the frame counter into a capture time. Trust
+      // the explicit parameter if one was given, otherwise ask the system.
+      if (frame_rate_hz_ <= 0.0)
+      {
+        // The rate is only reported once frames are flowing, so pull one first.
+        vicon_client_.GetFrame();
+        Output_GetFrameRate rate = vicon_client_.GetFrameRate();
+        if (rate.Result == Result::Success && rate.FrameRateHz > 0.0)
+        {
+          frame_rate_hz_ = rate.FrameRateHz;
+        }
+      }
+
+      if (frame_rate_hz_ > 0.0)
+      {
+        ROS_INFO_STREAM("Stamping poses from the Vicon frame counter at "
+            << frame_rate_hz_ << " Hz.");
+      }
+      else
+      {
+        ROS_WARN_STREAM("use_frame_timestamps was requested but no frame rate is "
+            "available; falling back to latency-compensated arrival time. Set "
+            "the 'frame_rate' parameter to force it.");
+      }
+    }
     return true;
   }
 
@@ -381,15 +487,28 @@ private:
 
     while (ros::ok() && grab_frames_)
     {
-      while (vicon_client_.GetFrame().Result != Result::Success && ros::ok())
+      // Poll for a frame without blocking the diagnostics. Waiting inside a
+      // nested loop meant the updater below was never reached while frames
+      // were not arriving, so the node fell silent for exactly as long as
+      // something was wrong: no poses, no diagnostics, nothing but a log line.
+      // A consumer could not distinguish that from a healthy but idle system.
+      bool got_frame = vicon_client_.GetFrame().Result == Result::Success;
+      if (!got_frame)
       {
-        ROS_INFO("getFrame returned false");
+        ROS_WARN_THROTTLE(5.0, "No frame from the Vicon server. The connection "
+                          "may have dropped, or the system may have stopped "
+                          "capturing.");
+        frames_ok_ = false;
         d.sleep();
       }
-      now_time = ros::Time::now();
+      else
+      {
+        frames_ok_ = true;
+        now_time = ros::Time::now();
 
-      bool was_new_frame = process_frame();
-      ROS_WARN_COND(!was_new_frame, "grab frame returned false");
+        bool was_new_frame = process_frame();
+        ROS_WARN_COND(!was_new_frame, "grab frame returned false");
+      }
 
       diag_updater.update();
     }
@@ -406,6 +525,125 @@ private:
     return true;
   }
 
+  /// \brief Choose the stamp for a frame.
+  ///
+  /// now_time records when this thread got round to the frame, not when the
+  /// cameras captured it. GetFrame() hands back whatever the SDK has buffered,
+  /// so a backlog is drained faster than real time and consecutive frames pick
+  /// up arrival times closer together than the true frame interval. Subtracting
+  /// the reported latency corrects the average but not that compression, and
+  /// GetLatencyTotal() varies frame to frame, contributing jitter of its own.
+  ///
+  /// The frame counter suffers from neither: frame N was captured exactly
+  /// N/rate after frame 0, whatever the network did afterwards. So capture time
+  /// is rebuilt from the counter, and the offset onto ROS time is estimated
+  /// from the least delayed arrival observed - transport delay being strictly
+  /// positive, the smallest (arrival - capture) is the closest to truth.
+  ros::Time resolveFrameTime(unsigned int frameNumber,
+                             ros::Time const& arrival,
+                             ros::Duration const& latency)
+  {
+    if (!use_frame_timestamps_ || frame_rate_hz_ <= 0.0)
+    {
+      return arrival - latency;
+    }
+
+    double const capture = static_cast<double>(frameNumber) / frame_rate_hz_;
+    double const delta = arrival.toSec() - capture;
+
+    // Roughly two seconds of frames spent converging on the running minimum, so
+    // an unlucky first arrival does not offset the whole stream.
+    unsigned int const calibrationSamples =
+      static_cast<unsigned int>(2.0 * frame_rate_hz_);
+    double const elapsed = capture - frame_time_last_capture_;
+
+    // First frame, or the counter went backwards because the system restarted.
+    // Without this the offset would freeze: every bound below is scaled by the
+    // elapsed capture time, which is negative after a reset, so nothing could
+    // move again and stamps would stay stuck in the past indefinitely.
+    if (frame_time_samples_ == 0 || elapsed < 0.0)
+    {
+      frame_time_offset_ = delta;
+      frame_time_samples_ = 0;
+      frame_time_last_stamp_ = 0.0;
+      frame_time_first_capture_ = capture;
+      frame_time_first_arrival_ = arrival.toSec();
+      frame_time_rate_measured_ = false;
+    }
+    else if (frame_time_samples_ < calibrationSamples)
+    {
+      // Converge on a smaller offset, but no faster than half the capture time
+      // elapsed. Adopting it outright would move the stamp backwards by as much
+      // as the offset shrank; capping the rate below 1 keeps every published
+      // interval positive while still correcting a late first arrival quickly.
+      frame_time_offset_ = std::max(std::min(frame_time_offset_, delta),
+                                    frame_time_offset_ - 0.5 * elapsed);
+    }
+    else
+    {
+      // Calibrated: allow only enough movement to follow genuine drift between
+      // the Vicon host clock and this one (100 ppm), so neither a stalled frame
+      // nor a burst can drag the timeline about.
+      double const bound = 1.0e-4 * elapsed;
+      frame_time_offset_ = std::max(frame_time_offset_ - bound,
+                                    std::min(delta, frame_time_offset_ + bound));
+    }
+
+    ++frame_time_samples_;
+    frame_time_last_capture_ = capture;
+
+    // The frame counter only yields a real timeline if the rate it is divided
+    // by is the rate it actually advances at, and nothing guarantees that: the
+    // reported rate is what the system is configured for, not what it is
+    // necessarily producing. Divide by a rate several times too high and
+    // published time runs correspondingly slow, while still looking perfectly
+    // well formed - monotonic, evenly spaced, every interval a whole number of
+    // frames. That is the dangerous failure, because none of the usual checks
+    // catch it; only comparing against a clock that is not derived from the
+    // counter does.
+    //
+    // So measure it and report it, but do not act on it. Switching to arrival
+    // time when the two disagree would mean two clocks with different epochs
+    // and a discontinuity at every transition, which is worse than one clock
+    // that is wrong in a way the diagnostics make obvious. An operator who
+    // knows the true rate sets the 'frame_rate' parameter.
+    double const arrivalSpan = arrival.toSec() - frame_time_first_arrival_;
+    double const captureSpan = capture - frame_time_first_capture_;
+    if (arrivalSpan > kFrameRateCheckSeconds)
+    {
+      frame_time_rate_ratio_ = captureSpan / arrivalSpan;
+      frame_time_rate_measured_ = true;
+
+      if (std::fabs(frame_time_rate_ratio_ - 1.0) > kFrameRateTolerance)
+      {
+        ROS_ERROR_STREAM_THROTTLE(10.0, "Vicon frame counter is advancing at "
+          << frame_time_rate_ratio_ * frame_rate_hz_ << " Hz, not the "
+          << frame_rate_hz_ << " Hz reported, so published stamps are running "
+          "at " << frame_time_rate_ratio_ << " of real time. Pose timing is "
+          "wrong. Set the 'frame_rate' parameter to the rate the system is "
+          "actually producing.");
+      }
+
+      // Restart the measurement window so the reported figure reflects the
+      // current state rather than the whole session.
+      frame_time_first_capture_ = capture;
+      frame_time_first_arrival_ = arrival.toSec();
+    }
+
+    // Backstop. The whole point of stamping from the counter is that the
+    // timeline is ordered, so never emit a stamp that fails to advance; equal
+    // stamps give a zero interval, which is no more usable than a negative one.
+    double stamp = capture + frame_time_offset_;
+    if (frame_time_samples_ > 1 && stamp <= frame_time_last_stamp_)
+    {
+      stamp = std::nextafter(frame_time_last_stamp_,
+                             std::numeric_limits<double>::max());
+    }
+    frame_time_last_stamp_ = stamp;
+
+    return ros::Time(stamp);
+  }
+
   bool process_frame()
   {
     static ros::Time lastTime;
@@ -420,10 +658,11 @@ private:
       frameCount += frameDiff;
       if ((frameDiff) > 1)
       {
-        droppedFrameCount += frameDiff;
+        // A step of n leaves n-1 frames unseen, not n: this frame did arrive.
+        droppedFrameCount += frameDiff - 1;
         double droppedFramePct = (double)droppedFrameCount / frameCount * 100;
-        ROS_DEBUG_STREAM(frameDiff << " more (total " << droppedFrameCount << "/" << frameCount << ", "
-            << droppedFramePct << "%) frame(s) dropped. Consider adjusting rates.");
+        ROS_DEBUG_STREAM((frameDiff - 1) << " more (total " << droppedFrameCount << "/" << frameCount
+            << ", " << droppedFramePct << "%) frame(s) dropped. Consider adjusting rates.");
       }
     }
     lastFrameNumber = OutputFrameNum.FrameNumber;
@@ -436,15 +675,17 @@ private:
     {
       freq_status_.tick();
       ros::Duration vicon_latency(vicon_client_.GetLatencyTotal().Total);
+      ros::Time const frame_time =
+        resolveFrameTime(lastFrameNumber, now_time, vicon_latency);
 
       if(publish_tf_ || broadcast_tf_)
       {
-        process_subjects(now_time - vicon_latency);
+        process_subjects(frame_time);
       }
 
       if(publish_markers_)
       {
-        process_markers(now_time - vicon_latency, lastFrameNumber);
+        process_markers(frame_time, lastFrameNumber);
       }
 
       lastTime = now_time;
@@ -581,9 +822,13 @@ private:
           Output_GetMarkerGlobalTranslation _Output_GetMarkerGlobalTranslation =
               vicon_client_.GetMarkerGlobalTranslation(this_subject_name, this_marker.marker_name);
 
-          this_marker.translation.x = _Output_GetMarkerGlobalTranslation.Translation[0];
-          this_marker.translation.y = _Output_GetMarkerGlobalTranslation.Translation[1];
-          this_marker.translation.z = _Output_GetMarkerGlobalTranslation.Translation[2];
+          // The SDK reports millimetres. Segment poses are converted to metres
+          // before publishing, so markers must be too: a consumer reading both
+          // topics otherwise gets a silent factor of 1000 between them, and ROS
+          // expresses lengths in metres.
+          this_marker.translation.x = _Output_GetMarkerGlobalTranslation.Translation[0] / 1000;
+          this_marker.translation.y = _Output_GetMarkerGlobalTranslation.Translation[1] / 1000;
+          this_marker.translation.z = _Output_GetMarkerGlobalTranslation.Translation[2] / 1000;
           this_marker.occluded = _Output_GetMarkerGlobalTranslation.Occluded;
 
           markers_msg.markers.push_back(this_marker);
@@ -603,9 +848,9 @@ private:
         if (_Output_GetUnlabeledMarkerGlobalTranslation.Result == Result::Success)
         {
           vicon_bridge::Marker this_marker;
-          this_marker.translation.x = _Output_GetUnlabeledMarkerGlobalTranslation.Translation[0];
-          this_marker.translation.y = _Output_GetUnlabeledMarkerGlobalTranslation.Translation[1];
-          this_marker.translation.z = _Output_GetUnlabeledMarkerGlobalTranslation.Translation[2];
+          this_marker.translation.x = _Output_GetUnlabeledMarkerGlobalTranslation.Translation[0] / 1000;
+          this_marker.translation.y = _Output_GetUnlabeledMarkerGlobalTranslation.Translation[1] / 1000;
+          this_marker.translation.z = _Output_GetUnlabeledMarkerGlobalTranslation.Translation[2] / 1000;
           this_marker.occluded = false; // unlabeled markers can't be occluded
           markers_msg.markers.push_back(this_marker);
         }

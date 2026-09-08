@@ -35,7 +35,9 @@
   <depend>dynamic_reconfigure</depend>
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
+  <depend>diagnostic_updater</depend>
   <depend>roscpp</depend>
+  <depend>std_msgs</depend>
   <depend>tf</depend>
 
   <test_depend>roslaunch</test_depend>

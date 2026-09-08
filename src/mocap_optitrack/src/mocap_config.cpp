@@ -66,6 +66,7 @@ bool check_and_get_param<std::string>(
 const int ServerDescription::Default::CommandPort = 1510;
 const int ServerDescription::Default::DataPort   = 9000;
 const std::string ServerDescription::Default::MulticastIpAddress = "224.0.0.1";
+const std::string ServerDescription::Default::MulticastInterface = "";
 const bool ServerDescription::Default::EnableOptitrack   = true;
 
 // Param keys
@@ -74,6 +75,7 @@ namespace rosparam
 namespace keys
 {
 const std::string MulticastIpAddress = "optitrack_config/multicast_address";
+const std::string MulticastInterface = "optitrack_config/multicast_interface";
 const std::string CommandPort = "optitrack_config/command_port";
 const std::string DataPort = "optitrack_config/data_port";
 const std::string EnableOptitrack = "optitrack_config/enable_optitrack";
@@ -82,6 +84,8 @@ const std::string RigidBodies = "rigid_bodies";
 const std::string PoseTopicName = "pose";
 const std::string Pose2dTopicName = "pose2d";
 const std::string OdomTopicName = "odom";
+const std::string MarkerErrorTopicName = "marker_error";
+const std::string TrackingValidTopicName = "tracking_valid";
 const std::string EnableTfPublisher = "tf";
 const std::string ChildFrameId = "child_frame_id";
 const std::string ParentFrameId = "parent_frame_id";
@@ -92,7 +96,8 @@ ServerDescription::ServerDescription() :
   commandPort(ServerDescription::Default::CommandPort),
   dataPort(ServerDescription::Default::DataPort),
   enableOptitrack(ServerDescription::Default::EnableOptitrack),
-  multicastIpAddress(ServerDescription::Default::MulticastIpAddress)
+  multicastIpAddress(ServerDescription::Default::MulticastIpAddress),
+  multicastInterface(ServerDescription::Default::MulticastInterface)
 {}
 
 void NodeConfiguration::fromRosParam(
@@ -109,6 +114,11 @@ void NodeConfiguration::fromRosParam(
   {
     ROS_WARN_STREAM("Could not get multicast address, using default: " <<
                     serverDescription.multicastIpAddress);
+  }
+
+  if (nh.hasParam(rosparam::keys::MulticastInterface))
+  {
+    nh.getParam(rosparam::keys::MulticastInterface, serverDescription.multicastInterface);
   }
 
   if (nh.hasParam(rosparam::keys::CommandPort))
@@ -212,6 +222,17 @@ void NodeConfiguration::fromRosParam(
           {
             publisherConfig.publishOdom = true;
           }
+
+          // Tracking quality outputs. These are optional and silent by default,
+          // but a consumer that cares why a pose is missing needs them: without
+          // them an untracked frame is indistinguishable from a lost one.
+          publisherConfig.publishMarkerError = impl::check_and_get_param(bodyParameters,
+                                   rosparam::keys::MarkerErrorTopicName,
+                                   publisherConfig.markerErrorTopicName);
+
+          publisherConfig.publishTrackingValid = impl::check_and_get_param(bodyParameters,
+                                   rosparam::keys::TrackingValidTopicName,
+                                   publisherConfig.trackingValidTopicName);
 
           bool readEnableTfPublisher = impl::check_and_get_param(bodyParameters,
                                rosparam::keys::EnableTfPublisher, publisherConfig.enableTfPublisher);

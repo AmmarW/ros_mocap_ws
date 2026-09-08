@@ -32,6 +32,10 @@
 #include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/Pose2D.h>
 #include <nav_msgs/Odometry.h>
+#include <std_msgs/Bool.h>
+#include <std_msgs/Float32.h>
+#include <sstream>
+#include <string>
 #include <vector>
 
 namespace mocap_optitrack
@@ -115,6 +119,12 @@ RigidBodyPublisher::RigidBodyPublisher(ros::NodeHandle &nh,
   if (config.publishOdom)
     odomPublisher = nh.advertise<nav_msgs::Odometry>(config.odomTopicName, 1000);
 
+  if (config.publishMarkerError)
+    markerErrorPublisher = nh.advertise<std_msgs::Float32>(config.markerErrorTopicName, 1000);
+
+  if (config.publishTrackingValid)
+    trackingValidPublisher = nh.advertise<std_msgs::Bool>(config.trackingValidTopicName, 1000);
+
   // Motive 1.7+ uses a new coordinate system
   // natNetVersion = (natNetVersion >= Version("1.7"));
   coordinatesVersion = natNetVersion;
@@ -126,6 +136,27 @@ RigidBodyPublisher::~RigidBodyPublisher()
 
 void RigidBodyPublisher::publish(ros::Time const& time, RigidBody const& body)
 {
+  // Report tracking state before deciding whether to publish a pose. A body
+  // that was not solved this frame produces no pose at all, which downstream is
+  // indistinguishable from a frame lost in transit; saying so explicitly is the
+  // only way a consumer can tell the two apart.
+  if (config.publishTrackingValid)
+  {
+    std_msgs::Bool trackingValidMsg;
+    trackingValidMsg.data = body.isTrackingValid;
+    trackingValidPublisher.publish(trackingValidMsg);
+  }
+
+  // Mean marker error rises as a solve degrades, so it leads the transition
+  // from tracked to untracked and is worth having even for frames that are
+  // about to be dropped.
+  if (config.publishMarkerError)
+  {
+    std_msgs::Float32 markerErrorMsg;
+    markerErrorMsg.data = body.meanMarkerError;
+    markerErrorPublisher.publish(markerErrorMsg);
+  }
+
   // don't do anything if no new data was provided
   if (!body.hasValidData())
   {
@@ -155,12 +186,6 @@ void RigidBodyPublisher::publish(ros::Time const& time, RigidBody const& body)
                    pose.pose.orientation.z,
                    pose.pose.orientation.w);
 
-  if (config.publishOdom)
-  {
-    odom.header.frame_id = config.parentFrameId;
-    odom.child_frame_id = config.childFrameId;
-    odomPublisher.publish(odom);
-  }
   if (config.publishOdom)
   {
     odom.header.frame_id = config.parentFrameId;
@@ -219,7 +244,38 @@ void RigidBodyPublishDispatcher::publish(
     {
       (*iter->second).publish(time, rigidBody);
     }
+    else
+    {
+      // Silently ignoring an unconfigured body makes a mismatch between the
+      // ids in the mocap software and the ids in this node's configuration
+      // look exactly like a node that is running correctly but seeing no
+      // data, which can go unnoticed for a whole session.
+      ROS_WARN_STREAM_THROTTLE(10.0,
+        "Receiving rigid body id " << rigidBody.bodyId << ", which is not in "
+        "this node's configuration, so it is not being published. Configured "
+        "ids: " << describeConfiguredIds() << ".");
+    }
   }
+}
+
+std::string RigidBodyPublishDispatcher::describeConfiguredIds() const
+{
+  if (rigidBodyPublisherMap.empty())
+  {
+    return "none";
+  }
+
+  std::ostringstream ids;
+  for (auto iter = rigidBodyPublisherMap.begin();
+       iter != rigidBodyPublisherMap.end(); ++iter)
+  {
+    if (iter != rigidBodyPublisherMap.begin())
+    {
+      ids << ", ";
+    }
+    ids << iter->first;
+  }
+  return ids.str();
 }
 
 }  // namespace mocap_optitrack

@@ -56,11 +56,26 @@ class UdpMulticastSocket
 {
 public:
 
-  /// \brief Maximum number of bytse that can be read at a time
-  static const int MAXRECV = 3000;
+  /// \brief Maximum number of bytes that can be read at a time.
+  ///
+  /// Sized to the largest UDP payload, so a data frame is never truncated
+  /// regardless of how many markers, rigid bodies or devices the server is
+  /// streaming. A smaller buffer silently discards the tail of a large frame,
+  /// which the deserializer cannot distinguish from a short one.
+  static const int MAXRECV = 65507;
 
-  /// Creates a socket and joins the multicast group with the given address
-  UdpMulticastSocket(const int local_port, const std::string multicast_ip = "224.0.0.1");
+  /// \brief Creates a socket and joins the multicast group with the given address.
+  /// \param local_port Port to bind and receive on.
+  /// \param multicast_ip Group to join.
+  /// \param local_interface_ip Address of the interface to join the group on.
+  ///        Empty means let the kernel choose, which it does from the route to
+  ///        the group: on a host with more than one interface that is usually
+  ///        whichever holds the default route, not necessarily the one the
+  ///        mocap system is on. Setting this addresses the interface directly
+  ///        and removes any dependence on routing.
+  UdpMulticastSocket(const int local_port,
+                     const std::string multicast_ip = "224.0.0.1",
+                     const std::string local_interface_ip = "");
 
   ///
   ~UdpMulticastSocket();
